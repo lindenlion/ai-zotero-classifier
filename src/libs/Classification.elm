@@ -5,11 +5,13 @@ module Classification exposing
     , classificationResultDecoder
     , decisionToString
     , emojiToRelevance
+    , intToRelevance
     , isRefusal
     , isStarTag
     , refusalResult
     , relevanceToDecision
     , relevanceToEmoji
+    , relevanceToInt
     , systemPrompt
     , userPrompt
     )
@@ -73,6 +75,47 @@ emojiToRelevance emoji =
             Just FourStars
 
         "⭐⭐⭐⭐⭐" ->
+            Just FiveStars
+
+        _ ->
+            Nothing
+
+
+relevanceToInt : Relevance -> Int
+relevanceToInt relevance =
+    case relevance of
+        OneStar ->
+            1
+
+        TwoStars ->
+            2
+
+        ThreeStars ->
+            3
+
+        FourStars ->
+            4
+
+        FiveStars ->
+            5
+
+
+intToRelevance : Int -> Maybe Relevance
+intToRelevance n =
+    case n of
+        1 ->
+            Just OneStar
+
+        2 ->
+            Just TwoStars
+
+        3 ->
+            Just ThreeStars
+
+        4 ->
+            Just FourStars
+
+        5 ->
             Just FiveStars
 
         _ ->

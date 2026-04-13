@@ -40,6 +40,7 @@ type alias ZoteroItemData =
     , tags : List ZoteroTag
     , collections : List String
     , itemType : String
+    , callNumber : String
     }
 
 
@@ -77,7 +78,17 @@ tagDecoder =
 
 itemDataDecoder : Decoder ZoteroItemData
 itemDataDecoder =
-    Decode.map5 ZoteroItemData
+    Decode.map5
+        (\title abstract tags collections itemType ->
+            \callNum ->
+                { title = title
+                , abstractNote = abstract
+                , tags = tags
+                , collections = collections
+                , itemType = itemType
+                , callNumber = callNum
+                }
+        )
         (Decode.field "title" Decode.string
             |> Decode.maybe
             |> Decode.map (Maybe.withDefault "No title")
@@ -98,6 +109,13 @@ itemDataDecoder =
             |> Decode.maybe
             |> Decode.map (Maybe.withDefault "")
         )
+        |> Decode.andThen
+            (\partialFn ->
+                Decode.field "callNumber" Decode.string
+                    |> Decode.maybe
+                    |> Decode.map (Maybe.withDefault "")
+                    |> Decode.map partialFn
+            )
 
 
 itemDecoder : Decoder ZoteroItem
@@ -151,9 +169,9 @@ encodeCreateCollection name =
         ]
 
 
-{-| Encode a PATCH body that updates both tags and collections in one request.
+{-| Encode a PATCH body that updates tags, collections, and callNumber in one request.
 -}
-encodeItemPatch : { tags : List ZoteroTag, collections : List String } -> Encode.Value
+encodeItemPatch : { tags : List ZoteroTag, collections : List String, callNumber : String } -> Encode.Value
 encodeItemPatch patch =
     Encode.object
         [ ( "tags"
@@ -163,6 +181,9 @@ encodeItemPatch patch =
           )
         , ( "collections"
           , Encode.list Encode.string patch.collections
+          )
+        , ( "callNumber"
+          , Encode.string patch.callNumber
           )
         ]
 
@@ -198,6 +219,7 @@ isReasoningNote : ZoteroNote -> Bool
 isReasoningNote note =
     String.contains "Inclusion reasoning" note.note
         || String.contains "Exclusion reasoning" note.note
+        || String.contains "auto-generated from structured data" note.note
 
 
 {-| Build the HTML content for a reasoning note.

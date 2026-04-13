@@ -14,7 +14,8 @@
             "dillonkearns/elm-pages": "12.1.2",
             "elm/core": "1.0.5",
             "elm/json": "1.1.4",
-            "elm/time": "1.0.0"
+            "elm/time": "1.0.0",
+            "rtfeldman/elm-iso8601-date-strings": "1.1.4"
         },
         "indirect": {
             "Chadtech/elm-bool-extra": "2.4.2",
@@ -52,7 +53,6 @@
             "robinheghan/murmur3": "1.0.0",
             "rtfeldman/elm-css": "18.0.0",
             "rtfeldman/elm-hex": "1.0.0",
-            "rtfeldman/elm-iso8601-date-strings": "1.1.4",
             "stil4m/elm-syntax": "7.3.9",
             "stil4m/structured-writer": "1.0.3",
             "the-sett/elm-pretty-printer": "3.3.1",

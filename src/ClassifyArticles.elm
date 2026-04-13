@@ -1,6 +1,7 @@
 module ClassifyArticles exposing (run)
 
 import AnthropicApi
+import Appraisal
 import BackendTask exposing (BackendTask)
 import BackendTask.Env as Env
 import BackendTask.Http
@@ -10,7 +11,9 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import FatalError exposing (FatalError)
+import Iso8601
 import Json.Decode as Decode
+import Json.Encode as Encode
 import Pages.Script as Script exposing (Script)
 import Stats exposing (CircuitBreakerAction(..), Stats, emptyStats)
 import Time
@@ -370,7 +373,7 @@ fetchItems config reprocessTag limit =
 {-| PATCH an item's tags and collections in a single request.
 No re-fetch needed — we use the version from the batch fetch.
 -}
-patchItem : Config -> ZoteroApi.ZoteroItem -> { tags : List ZoteroApi.ZoteroTag, collections : List String } -> BackendTask FatalError (Result String ())
+patchItem : Config -> ZoteroApi.ZoteroItem -> { tags : List ZoteroApi.ZoteroTag, collections : List String, callNumber : String } -> BackendTask FatalError (Result String ())
 patchItem config item patch =
     loggedRequest ("/items/" ++ item.key)
         { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items/" ++ item.key
@@ -519,14 +522,12 @@ isReprocessTag reprocessTag tagName =
             False
 
 
-{-| Update a Zotero item after classification. Three requests:
+{-| Update a Zotero item after classification.
 
-1.  PATCH item: set tags (strip old stars, add CLAUDE + new star + death\_after\_therapy)
-    and collections (add target collection, keep existing) in one request.
-2.  GET child notes to find existing reasoning notes.
-3.  Create/append/merge note as needed.
-
-No re-fetch needed — the batch-fetched version is used for the PATCH.
+1.  Build AppraisalData from existing callNumber (or migrate legacy data).
+2.  Insert the new Claude appraisal.
+3.  PATCH item: tags, collections, and callNumber (structured JSON).
+4.  GET child notes, then create/overwrite the reasoning note.
 
 -}
 updateItem :
@@ -537,99 +538,131 @@ updateItem :
     -> Classification.ClassificationResult
     -> BackendTask FatalError (Result String ())
 updateItem config collections reprocessTag item result =
-    let
-        decision =
-            Classification.relevanceToDecision result.relevance
+    BackendTask.Time.now
+        |> BackendTask.andThen
+            (\now ->
+                let
+                    timestamp =
+                        Iso8601.fromTime now
 
-        targetCollectionKey =
-            case decision of
-                Classification.Include ->
-                    collections.relevantKey
+                    appraisal =
+                        Appraisal.fromClassificationResult
+                            { model = config.anthropicModel, timestamp = timestamp }
+                            result
 
-                Classification.Exclude ->
-                    collections.irrelevantKey
+                    baseAppraisalData =
+                        resolveAppraisalData item
 
-        -- Strip old star tags, death_after_therapy, CLAUDE, and the reprocess tag
-        cleanedTags =
-            item.data.tags
-                |> List.filter
-                    (\t ->
-                        not (Classification.isStarTag t.tag)
-                            && t.tag
-                            /= "death_after_therapy"
-                            && t.tag
-                            /= processedTag
-                            && not (isReprocessTag reprocessTag t.tag)
-                    )
+                    appraisalData =
+                        Appraisal.setAppraisal "claude" appraisal baseAppraisalData
 
-        newTags =
-            cleanedTags
-                ++ [ { tag = processedTag }
-                   , { tag = Classification.relevanceToEmoji result.relevance }
-                   ]
-                ++ (if result.deathAfterTherapy then
-                        [ { tag = "death_after_therapy" } ]
+                    callNumberJson =
+                        Appraisal.encode appraisalData
+                            |> Encode.encode 0
 
-                    else
-                        []
-                   )
+                    decision =
+                        Classification.relevanceToDecision result.relevance
 
-        -- Add target collection, keeping existing ones (deduplicated)
-        newCollections =
-            if List.member targetCollectionKey item.data.collections then
-                item.data.collections
+                    targetCollectionKey =
+                        case decision of
+                            Classification.Include ->
+                                collections.relevantKey
 
-            else
-                item.data.collections ++ [ targetCollectionKey ]
+                            Classification.Exclude ->
+                                collections.irrelevantKey
 
-        noteHtml =
-            ZoteroApi.buildNoteHtml
-                { isInclude = decision == Classification.Include
-                , reasoning = result.reasoning
-                , note = result.note
+                    -- Strip old star tags, death_after_therapy, CLAUDE, and the reprocess tag
+                    cleanedTags =
+                        item.data.tags
+                            |> List.filter
+                                (\t ->
+                                    not (Classification.isStarTag t.tag)
+                                        && t.tag
+                                        /= "death_after_therapy"
+                                        && t.tag
+                                        /= processedTag
+                                        && not (isReprocessTag reprocessTag t.tag)
+                                )
+
+                    newTags =
+                        cleanedTags
+                            ++ [ { tag = processedTag }
+                               , { tag = Classification.relevanceToEmoji result.relevance }
+                               ]
+                            ++ (if result.deathAfterTherapy then
+                                    [ { tag = "death_after_therapy" } ]
+
+                                else
+                                    []
+                               )
+
+                    -- Add target collection, keeping existing ones (deduplicated)
+                    newCollections =
+                        if List.member targetCollectionKey item.data.collections then
+                            item.data.collections
+
+                        else
+                            item.data.collections ++ [ targetCollectionKey ]
+
+                    noteHtml =
+                        Appraisal.generateNoteHtml appraisalData
+                in
+                -- Request 1: PATCH tags + collections + callNumber
+                patchItem config item { tags = newTags, collections = newCollections, callNumber = callNumberJson }
+                    -- Request 2: GET child notes
+                    |> andThenResult (\_ -> getChildNotes config item.key)
+                    -- Request 3: create or overwrite reasoning note
+                    |> andThenResult (\childNotes -> handleNotes config item.key childNotes noteHtml)
+            )
+
+
+{-| Resolve the base AppraisalData for an item.
+
+  - If callNumber has valid JSON, decode it.
+  - If callNumber is empty but item has legacy CLAUDE data, migrate from tags.
+  - Otherwise, start empty.
+
+Note: legacy migration without note HTML — the full migration including note
+content happens lazily when we GET child notes during reprocessing.
+
+-}
+resolveAppraisalData : ZoteroApi.ZoteroItem -> Appraisal.AppraisalData
+resolveAppraisalData item =
+    case Decode.decodeString Appraisal.decode item.data.callNumber of
+        Ok data ->
+            data
+
+        Err _ ->
+            Appraisal.migrateFromLegacy
+                { tags = item.data.tags
+                , reasoningNoteHtml = Nothing
                 }
-    in
-    -- Request 1: PATCH tags + collections
-    patchItem config item { tags = newTags, collections = newCollections }
-        -- Request 2: GET child notes
-        |> andThenResult (\_ -> getChildNotes config item.key)
-        -- Request 3: create/append/merge note
-        |> andThenResult (\childNotes -> handleNotes config item.key childNotes noteHtml)
+                |> Maybe.withDefault Appraisal.empty
 
 
-{-| Handle note creation/appending/merging.
+{-| Handle note creation or overwrite.
+The note is always fully regenerated from AppraisalData.
 
   - 0 existing reasoning notes → create new
-  - 1 existing reasoning note → append new reasoning with separator
-  - 2+ existing reasoning notes → merge all into first, append new, delete extras
+  - 1 existing reasoning note → overwrite with new content
+  - 2+ existing reasoning notes → overwrite first, delete extras
 
 -}
 handleNotes : Config -> String -> List ZoteroApi.ZoteroNote -> String -> BackendTask FatalError (Result String ())
-handleNotes config parentItemKey childNotes newNoteHtml =
+handleNotes config parentItemKey childNotes noteHtml =
     let
         reasoningNotes =
             List.filter ZoteroApi.isReasoningNote childNotes
     in
     case reasoningNotes of
         [] ->
-            createNote config parentItemKey newNoteHtml
+            createNote config parentItemKey noteHtml
 
         [ single ] ->
-            let
-                merged =
-                    single.note ++ "<hr/>" ++ newNoteHtml
-            in
-            patchNote config single merged
+            patchNote config single noteHtml
 
         first :: rest ->
-            let
-                allExistingContent =
-                    reasoningNotes |> List.map .note
-
-                merged =
-                    String.join "<hr/>" allExistingContent ++ "<hr/>" ++ newNoteHtml
-            in
-            patchNote config first merged
+            patchNote config first noteHtml
                 |> andThenResult (\_ -> deleteExtraNotes config rest)
 
 

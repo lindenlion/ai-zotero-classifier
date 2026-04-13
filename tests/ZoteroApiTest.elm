@@ -47,6 +47,32 @@ suite =
                     Decode.decodeString ZoteroApi.itemDecoder json
                         |> Result.map (\item -> ( item.data.title, item.data.abstractNote ))
                         |> Expect.equal (Ok ( "No title", "No abstract available" ))
+            , test "decodes callNumber when present" <|
+                \_ ->
+                    let
+                        json =
+                            """
+                            {
+                                "key": "CN1",
+                                "version": 1,
+                                "data": {
+                                    "callNumber": "{\\"v\\":1}"
+                                }
+                            }
+                            """
+                    in
+                    Decode.decodeString ZoteroApi.itemDecoder json
+                        |> Result.map (.data >> .callNumber)
+                        |> Expect.equal (Ok "{\"v\":1}")
+            , test "defaults callNumber to empty string when absent" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "CN2", "version": 1, "data": {}}"""
+                    in
+                    Decode.decodeString ZoteroApi.itemDecoder json
+                        |> Result.map (.data >> .callNumber)
+                        |> Expect.equal (Ok "")
             , test "decodes item version as int" <|
                 \_ ->
                     let
@@ -107,6 +133,7 @@ suite =
                                 , tags = [ { tag = "kw1" }, { tag = "kw2" } ]
                                 , collections = []
                                 , itemType = "journalArticle"
+                                , callNumber = ""
                                 }
                             }
 
@@ -133,6 +160,7 @@ suite =
                                 , tags = []
                                 , collections = []
                                 , itemType = "journalArticle"
+                                , callNumber = ""
                                 }
                             }
                     in
@@ -183,23 +211,25 @@ suite =
                         |> Expect.equal (Ok "<p>Hello</p>")
             ]
         , describe "encodeItemPatch"
-            [ test "encodes tags and collections together" <|
+            [ test "encodes tags, collections, and callNumber together" <|
                 \_ ->
                     let
                         encoded =
                             ZoteroApi.encodeItemPatch
                                 { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐" } ]
                                 , collections = [ "COL1", "COL2" ]
+                                , callNumber = "{\"v\":1}"
                                 }
                                 |> Encode.encode 0
                     in
                     Decode.decodeString
-                        (Decode.map2 Tuple.pair
+                        (Decode.map3 (\t c cn -> ( t, c, cn ))
                             (Decode.field "tags" (Decode.list (Decode.field "tag" Decode.string)))
                             (Decode.field "collections" (Decode.list Decode.string))
+                            (Decode.field "callNumber" Decode.string)
                         )
                         encoded
-                        |> Expect.equal (Ok ( [ "CLAUDE", "⭐⭐⭐" ], [ "COL1", "COL2" ] ))
+                        |> Expect.equal (Ok ( [ "CLAUDE", "⭐⭐⭐" ], [ "COL1", "COL2" ], "{\"v\":1}" ))
             ]
         , describe "encodeNotePatch"
             [ test "encodes note content" <|
@@ -251,6 +281,11 @@ suite =
                     ZoteroApi.isReasoningNote
                         { key = "N4", version = 1, note = "" }
                         |> Expect.equal False
+            , test "identifies auto-generated note" <|
+                \_ ->
+                    ZoteroApi.isReasoningNote
+                        { key = "N5", version = 1, note = "<p><em>This note is auto-generated from structured data</em></p>" }
+                        |> Expect.equal True
             ]
         , describe "buildNoteHtml"
             [ test "include note contains Todo and Inclusion reasoning" <|
