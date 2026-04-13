@@ -1,0 +1,11 @@
+.claude/
+.devbox/
+.env
+.vscode/
+node_modules/
+elm-stuff/
+dist/
+.elm-pages/
+functions/render/elm-pages-cli.mjs
+functions/server-render/elm-pages-cli.mjs
+*dev.mjs

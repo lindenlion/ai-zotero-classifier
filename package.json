@@ -1,0 +1,24 @@
+{
+  "name": "ai-zotero-classifier",
+  "type": "module",
+  "scripts": {
+    "classify": "elm-pages run src/ClassifyArticles.elm",
+    "classify:all": "elm-pages run src/ClassifyArticles.elm --max",
+    "build": "VERSION=$(node -p \"JSON.parse(require('fs').readFileSync('./elm.json','utf8')).version\") && elm-pages bundle-script --optimize=2 --set-version=$VERSION --output=./build/ai-zotero-classifier_$VERSION.mjs src/ClassifyArticles.elm && chmod +x ./build/ai-zotero-classifier_$VERSION.mjs",
+    "build:dev": "elm-pages bundle-script --optimize=2 --set-version=dev --output=./build/ai-zotero-classifier_dev.mjs src/ClassifyArticles.elm && chmod +x ./build/ai-zotero-classifier_dev.mjs",
+    "test": "elm-test-rs",
+    "review": "elm-review",
+    "review:fix": "elm-review --fix",
+    "review:deps": "elm-review --rules=NoUnused.Dependencies",
+    "format": "elm-format src/ review/src/ tests/ --yes"
+  },
+  "devDependencies": {
+    "elm-format": "^0.8.7",
+    "elm-json": "^0.2.13",
+    "elm-pages": "3.3.4",
+    "elm-review": "^2.13.5",
+    "elm-test-rs": "^3.0.2-0",
+    "lamdera": "^0.19.1-1.4.0"
+  },
+  "dependencies": {}
+}

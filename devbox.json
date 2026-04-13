@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": [
+    "claude-code@latest",
+    "nodejs@22"
+  ],
+  "env_from": ".env",
+  "shell": {
+    "init_hook": [
+      "npm run",
+      "export PATH=$PATH:./node_modules/.bin"
+    ],
+    "scripts": {
+      "init": "npm install"
+    }
+  }
+}
