@@ -2,7 +2,7 @@
     "type": "application",
     "summary": "A command-line tool for classifying articles in Zotero using AI.",
     "license": "MIT",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "source-directories": [
         "src",
         "src/libs"
