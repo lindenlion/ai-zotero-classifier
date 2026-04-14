@@ -288,6 +288,116 @@ suite =
                         |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
                         |> Maybe.map .reasoning
                         |> Expect.equal (Just "Not about IEI")
+            , test "extracts Todo note from standard format" <|
+                \_ ->
+                    let
+                        noteHtml =
+                            "<p><strong>Todo:</strong></p><p>Check full text for details</p><p><em>Inclusion reasoning: IEI patient died</em></p>"
+
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐⭐" } ]
+                                , reasoningNoteHtml = Just noteHtml
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "Check full text for details")
+            , test "extracts Todo note with newlines (Zotero br tags)" <|
+                \_ ->
+                    let
+                        noteHtml =
+                            "<p><strong>Todo:</strong></p><p>Check foo<br/>and bar in fulltext</p><p><em>Inclusion reasoning: relevant</em></p>"
+
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐⭐" } ]
+                                , reasoningNoteHtml = Just noteHtml
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "Check foo<br/>and bar in fulltext")
+            , test "extracts Todo note split across multiple p tags" <|
+                \_ ->
+                    let
+                        noteHtml =
+                            "<p><strong>Todo:</strong></p><p>Check foo</p><p>and bar in fulltext</p><p><em>Inclusion reasoning: relevant</em></p>"
+
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐⭐" } ]
+                                , reasoningNoteHtml = Just noteHtml
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "Check foo</p><p>and bar in fulltext")
+            , test "extracts Todo note with Zotero div wrapper" <|
+                \_ ->
+                    let
+                        noteHtml =
+                            "<div><p><strong>Todo:</strong></p><p>Verify infection type</p><p><em>Inclusion reasoning: relevant</em></p></div>"
+
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐⭐" } ]
+                                , reasoningNoteHtml = Just noteHtml
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "Verify infection type")
+            , test "returns empty note for exclusion (no Todo)" <|
+                \_ ->
+                    let
+                        noteHtml =
+                            "<p><em>Exclusion reasoning: Not about IEI</em></p>"
+
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐" } ]
+                                , reasoningNoteHtml = Just noteHtml
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "")
+            , test "returns empty note when no reasoning note exists" <|
+                \_ ->
+                    let
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐⭐" } ]
+                                , reasoningNoteHtml = Nothing
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "")
+            , test "extracts Todo when Todo text is on same line as strong tag" <|
+                \_ ->
+                    let
+                        -- Some Zotero versions may render inline
+                        noteHtml =
+                            "<p><strong>Todo:</strong> Check the dosage</p><p><em>Inclusion reasoning: relevant</em></p>"
+
+                        result =
+                            Appraisal.migrateFromLegacy
+                                { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐⭐" } ]
+                                , reasoningNoteHtml = Just noteHtml
+                                }
+                    in
+                    result
+                        |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
+                        |> Maybe.map .note
+                        |> Expect.equal (Just "Check the dosage")
             , test "returns Nothing without CLAUDE tag" <|
                 \_ ->
                     Appraisal.migrateFromLegacy

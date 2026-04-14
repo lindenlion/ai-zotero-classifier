@@ -10,6 +10,7 @@ module ZoteroApi exposing
     , collectionListDecoder
     , encodeCreateCollection
     , encodeCreateNote
+    , encodeCreateSubCollection
     , encodeItemPatch
     , encodeNotePatch
     , isReasoningNote
@@ -47,6 +48,7 @@ type alias ZoteroItemData =
 type alias ZoteroCollection =
     { key : String
     , name : String
+    , parentCollection : String
     }
 
 
@@ -146,9 +148,18 @@ noteListDecoder =
 
 collectionDecoder : Decoder ZoteroCollection
 collectionDecoder =
-    Decode.map2 ZoteroCollection
+    Decode.map3 ZoteroCollection
         (Decode.field "key" Decode.string)
         (Decode.at [ "data", "name" ] Decode.string)
+        (Decode.at [ "data", "parentCollection" ]
+            (Decode.oneOf
+                [ Decode.string
+                , Decode.succeed ""
+                ]
+            )
+            |> Decode.maybe
+            |> Decode.map (Maybe.withDefault "")
+        )
 
 
 collectionListDecoder : Decoder (List ZoteroCollection)
@@ -165,6 +176,16 @@ encodeCreateCollection name =
     Encode.list identity
         [ Encode.object
             [ ( "name", Encode.string name )
+            ]
+        ]
+
+
+encodeCreateSubCollection : String -> String -> Encode.Value
+encodeCreateSubCollection name parentKey =
+    Encode.list identity
+        [ Encode.object
+            [ ( "name", Encode.string name )
+            , ( "parentCollection", Encode.string parentKey )
             ]
         ]
 

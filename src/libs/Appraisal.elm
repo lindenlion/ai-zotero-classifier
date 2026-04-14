@@ -2,12 +2,15 @@ module Appraisal exposing
     ( ASReviewData
     , AppraisalData
     , ProviderAppraisal
+    , currentSchemaVersion
     , decode
     , empty
     , encode
     , fromClassificationResult
     , generateNoteHtml
     , migrateFromLegacy
+    , migrateToCurrentVersion
+    , needsMigration
     , setAppraisal
     )
 
@@ -46,12 +49,36 @@ type alias ASReviewData =
     }
 
 
+currentSchemaVersion : Int
+currentSchemaVersion =
+    1
+
+
 empty : AppraisalData
 empty =
-    { version = 1
+    { version = currentSchemaVersion
     , appraisals = Dict.empty
     , asreview = Nothing
     }
+
+
+needsMigration : AppraisalData -> Bool
+needsMigration data =
+    data.version < currentSchemaVersion
+
+
+{-| Upgrade AppraisalData from any older version to current.
+Currently a no-op (only v1 exists). Add migration steps here as schema evolves.
+-}
+migrateToCurrentVersion : AppraisalData -> AppraisalData
+migrateToCurrentVersion data =
+    if data.version >= currentSchemaVersion then
+        data
+
+    else
+        -- Future: chain version upgrades here, e.g.:
+        -- data |> migrateV1toV2 |> migrateV2toV3
+        { data | version = currentSchemaVersion }
 
 
 
@@ -362,16 +389,59 @@ extractReasoning html =
 extractTodoNote : String -> String
 extractTodoNote html =
     if String.contains "Todo:" html then
-        case String.split "Todo:</strong></p><p>" html of
-            _ :: rest :: _ ->
-                rest
-                    |> String.split "</p>"
-                    |> List.head
-                    |> Maybe.withDefault ""
-                    |> String.trim
+        let
+            -- Try format: Todo:</strong></p><p>...content...</p><p><em>reasoning
+            splitOnBlock =
+                case String.split "Todo:</strong></p><p>" html of
+                    _ :: rest :: _ ->
+                        rest
+                            |> String.split "<p><em>"
+                            |> List.head
+                            |> Maybe.withDefault ""
+                            |> stripTrailingCloseTags
+                            |> String.trim
 
-            _ ->
-                ""
+                    _ ->
+                        ""
+
+            -- Try format: Todo:</strong> ...content...</p>
+            splitOnInline =
+                case String.split "Todo:</strong>" html of
+                    _ :: rest :: _ ->
+                        rest
+                            |> String.split "<p><em>"
+                            |> List.head
+                            |> Maybe.withDefault ""
+                            |> stripTrailingCloseTags
+                            |> String.trim
+
+                    _ ->
+                        ""
+        in
+        if splitOnBlock /= "" then
+            splitOnBlock
+
+        else
+            splitOnInline
 
     else
         ""
+
+
+{-| Strip trailing </p> and </div> tags from extracted content. -}
+stripTrailingCloseTags : String -> String
+stripTrailingCloseTags str =
+    str
+        |> String.trimRight
+        |> stripSuffix "</p>"
+        |> stripSuffix "</div>"
+        |> String.trimRight
+
+
+stripSuffix : String -> String -> String
+stripSuffix suffix str =
+    if String.endsWith suffix str then
+        String.dropRight (String.length suffix) str
+
+    else
+        str

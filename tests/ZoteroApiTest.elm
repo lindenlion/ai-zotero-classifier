@@ -100,14 +100,30 @@ suite =
                         |> Expect.equal (Ok 2)
             ]
         , describe "collectionDecoder"
-            [ test "decodes a collection" <|
+            [ test "decodes a collection without parentCollection" <|
                 \_ ->
                     let
                         json =
                             """{"key": "COL1", "data": {"name": "Claude included"}}"""
                     in
                     Decode.decodeString ZoteroApi.collectionDecoder json
-                        |> Expect.equal (Ok { key = "COL1", name = "Claude included" })
+                        |> Expect.equal (Ok { key = "COL1", name = "Claude included", parentCollection = "" })
+            , test "decodes a collection with parentCollection string" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "SUB1", "data": {"name": "version_1", "parentCollection": "PARENT_KEY"}}"""
+                    in
+                    Decode.decodeString ZoteroApi.collectionDecoder json
+                        |> Expect.equal (Ok { key = "SUB1", name = "version_1", parentCollection = "PARENT_KEY" })
+            , test "decodes a collection with parentCollection false (top-level)" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "TOP1", "data": {"name": "Top level", "parentCollection": false}}"""
+                    in
+                    Decode.decodeString ZoteroApi.collectionDecoder json
+                        |> Expect.equal (Ok { key = "TOP1", name = "Top level", parentCollection = "" })
             ]
         , describe "collectionListDecoder"
             [ test "decodes list of collections" <|
@@ -180,6 +196,24 @@ suite =
                         (Decode.index 0 (Decode.field "name" Decode.string))
                         encoded
                         |> Expect.equal (Ok "My Collection")
+            ]
+        , describe "encodeCreateSubCollection"
+            [ test "encodes sub-collection with parent key" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeCreateSubCollection "version_1" "PARENT_KEY"
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.index 0
+                            (Decode.map2 Tuple.pair
+                                (Decode.field "name" Decode.string)
+                                (Decode.field "parentCollection" Decode.string)
+                            )
+                        )
+                        encoded
+                        |> Expect.equal (Ok ( "version_1", "PARENT_KEY" ))
             ]
         , describe "encodeCreateNote"
             [ test "encodes note with parent item" <|

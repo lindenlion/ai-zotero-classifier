@@ -10,6 +10,7 @@ import Classification
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
+import Dict exposing (Dict)
 import FatalError exposing (FatalError)
 import Iso8601
 import Json.Decode as Decode
@@ -51,6 +52,21 @@ processedTag =
     "CLAUDE"
 
 
+migrationParentCollection : String
+migrationParentCollection =
+    "data_schema_migrations"
+
+
+versionCollectionPrefix : String
+versionCollectionPrefix =
+    "version_"
+
+
+versionCollectionName : Int -> String
+versionCollectionName n =
+    versionCollectionPrefix ++ String.fromInt n
+
+
 
 -- CLI
 
@@ -58,6 +74,7 @@ processedTag =
 type alias CliOptions =
     { reprocessTag : Maybe String
     , max : Maybe String
+    , migrate : Maybe String
     }
 
 
@@ -74,6 +91,10 @@ program =
                     (Option.optionalKeywordArg "max"
                         |> Option.withDescription "Maximum number of articles to process. 0 = all. Skips the interactive prompt."
                     )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "migrate"
+                        |> Option.withDescription "Migration-only mode (no AI calls). Optional integer = oldest schema version to migrate from. Omit value to migrate all CLAUDE-tagged articles."
+                    )
             )
 
 
@@ -85,22 +106,27 @@ run : Script
 run =
     Script.withCliOptions program
         (\options ->
-            logBanner options.reprocessTag
+            logBanner options
                 |> BackendTask.andThen (\_ -> loadConfig)
                 |> BackendTask.andThen (\config -> initAndProcess config options)
         )
 
 
-logBanner : Maybe String -> BackendTask FatalError ()
-logBanner reprocessTag =
+logBanner : CliOptions -> BackendTask FatalError ()
+logBanner options =
     let
         modeMsg =
-            case reprocessTag of
-                Just tag ->
-                    "Mode: REPROCESS articles tagged \"" ++ tag ++ "\" (tag will be stripped)"
+            case options.migrate of
+                Just _ ->
+                    "Mode: MIGRATE schema (no AI calls)"
 
                 Nothing ->
-                    "Mode: process new articles (no CLAUDE tag)"
+                    case options.reprocessTag of
+                        Just tag ->
+                            "Mode: REPROCESS articles tagged \"" ++ tag ++ "\" (tag will be stripped)"
+
+                        Nothing ->
+                            "Mode: process new articles (no CLAUDE tag)"
     in
     Script.log ("🔬 PubMed Article Classifier for IEI Research\n" ++ String.repeat 60 "=" ++ "\n" ++ modeMsg)
 
@@ -108,7 +134,7 @@ logBanner reprocessTag =
 initAndProcess : Config -> CliOptions -> BackendTask FatalError ()
 initAndProcess config options =
     Script.log ("✓ Loaded configuration for library: " ++ config.zoteroLibraryId)
-        |> BackendTask.andThen (\_ -> resolveCollections config)
+        |> BackendTask.andThen (\_ -> resolveAllCollections config)
         |> BackendTask.andThen
             (\collections ->
                 Script.log
@@ -120,10 +146,28 @@ initAndProcess config options =
                         ++ irrelevantCollection
                         ++ " ("
                         ++ collections.irrelevantKey
+                        ++ ")\n✓ Current schema version: "
+                        ++ String.fromInt Appraisal.currentSchemaVersion
+                        ++ " (collection: "
+                        ++ collections.currentVersionKey
                         ++ ")"
                     )
                     |> BackendTask.andThen (\_ -> resolveMaxArticles options.max)
-                    |> BackendTask.andThen (\maxArticles -> processAll config collections options.reprocessTag maxArticles)
+                    |> BackendTask.andThen
+                        (\maxArticles ->
+                            case options.migrate of
+                                Just migrateArg ->
+                                    let
+                                        fromVersion =
+                                            migrateArg
+                                                |> String.trim
+                                                |> String.toInt
+                                    in
+                                    migrateAll config collections fromVersion maxArticles
+
+                                Nothing ->
+                                    processAll config collections options.reprocessTag maxArticles
+                        )
             )
 
 
@@ -202,6 +246,8 @@ loadConfig =
 type alias Collections =
     { relevantKey : String
     , irrelevantKey : String
+    , currentVersionKey : String
+    , versionKeys : Dict Int String
     }
 
 
@@ -262,8 +308,8 @@ andThenResult f task =
             )
 
 
-resolveCollections : Config -> BackendTask FatalError Collections
-resolveCollections config =
+resolveAllCollections : Config -> BackendTask FatalError Collections
+resolveAllCollections config =
     let
         url =
             zoteroBaseUrl config.zoteroLibraryId ++ "/collections"
@@ -284,9 +330,54 @@ resolveCollections config =
             )
         |> BackendTask.andThen
             (\allCollections ->
-                BackendTask.map2 Collections
+                BackendTask.map2 Tuple.pair
                     (ensureCollection config relevantCollection allCollections)
                     (ensureCollection config irrelevantCollection allCollections)
+                    |> BackendTask.andThen
+                        (\( relKey, irrelKey ) ->
+                            resolveVersionCollections config allCollections
+                                |> BackendTask.map
+                                    (\( currentKey, vKeys ) ->
+                                        { relevantKey = relKey
+                                        , irrelevantKey = irrelKey
+                                        , currentVersionKey = currentKey
+                                        , versionKeys = vKeys
+                                        }
+                                    )
+                        )
+            )
+
+
+resolveVersionCollections : Config -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError ( String, Dict Int String )
+resolveVersionCollections config allCollections =
+    ensureCollection config migrationParentCollection allCollections
+        |> BackendTask.andThen
+            (\parentKey ->
+                let
+                    currentName =
+                        versionCollectionName Appraisal.currentSchemaVersion
+                in
+                ensureSubCollection config currentName parentKey allCollections
+                    |> BackendTask.map
+                        (\currentKey ->
+                            let
+                                existingVersionKeys =
+                                    allCollections
+                                        |> List.filter (\c -> c.parentCollection == parentKey && String.startsWith versionCollectionPrefix c.name)
+                                        |> List.filterMap
+                                            (\c ->
+                                                c.name
+                                                    |> String.dropLeft (String.length versionCollectionPrefix)
+                                                    |> String.toInt
+                                                    |> Maybe.map (\n -> ( n, c.key ))
+                                            )
+                                        |> Dict.fromList
+
+                                vKeys =
+                                    Dict.insert Appraisal.currentSchemaVersion currentKey existingVersionKeys
+                            in
+                            ( currentKey, vKeys )
+                        )
             )
 
 
@@ -300,13 +391,23 @@ ensureCollection config name allCollections =
             createCollection config name
 
 
+ensureSubCollection : Config -> String -> String -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError String
+ensureSubCollection config name parentKey allCollections =
+    case allCollections |> List.filter (\c -> c.name == name && c.parentCollection == parentKey) |> List.head |> Maybe.map .key of
+        Just key ->
+            BackendTask.succeed key
+
+        Nothing ->
+            createSubCollection config name parentKey
+
+
 createCollection : Config -> String -> BackendTask FatalError String
 createCollection config name =
     let
         url =
             zoteroBaseUrl config.zoteroLibraryId ++ "/collections"
     in
-    Script.log "POST /collections"
+    Script.log ("POST /collections (create: " ++ name ++ ")")
         |> BackendTask.andThen
             (\_ ->
                 BackendTask.Http.request
@@ -325,6 +426,35 @@ createCollection config name =
         |> BackendTask.andThen
             (\key ->
                 Script.log ("Created new collection: " ++ name)
+                    |> BackendTask.map (\_ -> key)
+            )
+
+
+createSubCollection : Config -> String -> String -> BackendTask FatalError String
+createSubCollection config name parentKey =
+    let
+        url =
+            zoteroBaseUrl config.zoteroLibraryId ++ "/collections"
+    in
+    Script.log ("POST /collections (create sub-collection: " ++ name ++ ")")
+        |> BackendTask.andThen
+            (\_ ->
+                BackendTask.Http.request
+                    { url = url
+                    , method = "POST"
+                    , headers = zoteroHeaders config.zoteroApiKey
+                    , body = BackendTask.Http.jsonBody (ZoteroApi.encodeCreateSubCollection name parentKey)
+                    , retries = Nothing
+                    , timeoutInMs = Just 30000
+                    }
+                    (BackendTask.Http.expectJson
+                        (Decode.at [ "successful", "0", "key" ] Decode.string)
+                    )
+                    |> BackendTask.allowFatal
+            )
+        |> BackendTask.andThen
+            (\key ->
+                Script.log ("Created new sub-collection: " ++ name)
                     |> BackendTask.map (\_ -> key)
             )
 
@@ -352,7 +482,7 @@ fetchItems config reprocessTag limit =
                 ++ tagFilter
                 ++ "&limit="
                 ++ String.fromInt limit
-                ++ "&itemType=journalArticle"
+                ++ "&itemType=-note"
     in
     Script.log ("GET /items?" ++ tagFilter)
         |> BackendTask.andThen
@@ -483,11 +613,11 @@ classifyArticle config article =
         , timeoutInMs = Just 120000
         }
         (BackendTask.Http.expectJson AnthropicApi.messageResponseDecoder)
-        |> BackendTask.map (Result.andThen (parseClassificationResponse config))
+        |> BackendTask.map (Result.andThen parseClassificationResponse)
 
 
-parseClassificationResponse : Config -> AnthropicApi.MessageResponse -> Result String Classification.ClassificationResult
-parseClassificationResponse _ response =
+parseClassificationResponse : AnthropicApi.MessageResponse -> Result String Classification.ClassificationResult
+parseClassificationResponse response =
     case response.stopReason of
         AnthropicApi.Refusal ->
             Ok Classification.refusalResult
@@ -596,13 +726,18 @@ updateItem config collections reprocessTag item result =
                                     []
                                )
 
-                    -- Add target collection, keeping existing ones (deduplicated)
-                    newCollections =
-                        if List.member targetCollectionKey item.data.collections then
-                            item.data.collections
+                    -- Add target + version collections, remove old version keys
+                    allVersionKeys =
+                        Dict.values collections.versionKeys
 
-                        else
-                            item.data.collections ++ [ targetCollectionKey ]
+                    collectionsWithoutOldVersions =
+                        item.data.collections
+                            |> List.filter (\c -> not (List.member c allVersionKeys))
+
+                    newCollections =
+                        collectionsWithoutOldVersions
+                            ++ [ targetCollectionKey, collections.currentVersionKey ]
+                            |> dedup
 
                     noteHtml =
                         Appraisal.generateNoteHtml appraisalData
@@ -628,7 +763,7 @@ content happens lazily when we GET child notes during reprocessing.
 -}
 resolveAppraisalData : ZoteroApi.ZoteroItem -> Appraisal.AppraisalData
 resolveAppraisalData item =
-    case Decode.decodeString Appraisal.decode item.data.callNumber of
+    (case Decode.decodeString Appraisal.decode item.data.callNumber of
         Ok data ->
             data
 
@@ -638,6 +773,43 @@ resolveAppraisalData item =
                 , reasoningNoteHtml = Nothing
                 }
                 |> Maybe.withDefault Appraisal.empty
+    )
+        |> Appraisal.migrateToCurrentVersion
+
+
+{-| Resolve AppraisalData with note content for full legacy migration.
+-}
+resolveAppraisalDataWithNotes : ZoteroApi.ZoteroItem -> Maybe String -> Appraisal.AppraisalData
+resolveAppraisalDataWithNotes item reasoningNoteHtml =
+    (case Decode.decodeString Appraisal.decode item.data.callNumber of
+        Ok data ->
+            data
+
+        Err _ ->
+            Appraisal.migrateFromLegacy
+                { tags = item.data.tags
+                , reasoningNoteHtml = reasoningNoteHtml
+                }
+                |> Maybe.withDefault Appraisal.empty
+    )
+        |> Appraisal.migrateToCurrentVersion
+
+
+{-| Deduplicate a list preserving order.
+-}
+dedup : List String -> List String
+dedup list =
+    List.foldl
+        (\item ( seen, acc ) ->
+            if List.member item seen then
+                ( seen, acc )
+
+            else
+                ( item :: seen, acc ++ [ item ] )
+        )
+        ( [], [] )
+        list
+        |> Tuple.second
 
 
 {-| Handle note creation or overwrite.
@@ -678,7 +850,277 @@ deleteExtraNotes config notes =
 
 
 
--- Batch processing
+-- Migration
+
+
+{-| Fetch articles for migration.
+
+  - No fromVersion: fetch all articles with CLAUDE tag.
+  - Just N: fetch from version\_N, version\_(N+1), ..., version\_(current-1) collections.
+
+-}
+fetchItemsForMigration : Config -> Collections -> Maybe Int -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
+fetchItemsForMigration config collections fromVersion limit =
+    let
+        startVersion =
+            fromVersion |> Maybe.withDefault 0
+
+        -- Version 0 = legacy articles with CLAUDE tag but no version collection.
+        -- These can only be found by tag search, not by collection.
+        needsTagFetch =
+            startVersion <= 0
+
+        -- Versions 1+ have their own version collections
+        collectionVersionsToFetch =
+            List.range (max 1 startVersion) (Appraisal.currentSchemaVersion - 1)
+
+        collectionKeysToFetch =
+            collectionVersionsToFetch
+                |> List.filterMap (\v -> Dict.get v collections.versionKeys)
+    in
+    -- Step 1: fetch legacy (tag-based) items if needed
+    (if needsTagFetch then
+        let
+            url =
+                zoteroBaseUrl config.zoteroLibraryId
+                    ++ "/items?tag="
+                    ++ processedTag
+                    ++ "&limit="
+                    ++ String.fromInt limit
+                    ++ "&itemType=-note"
+        in
+        Script.log ("GET /items?tag=" ++ processedTag ++ " (migration: legacy v0)")
+            |> BackendTask.andThen
+                (\_ ->
+                    BackendTask.Http.request
+                        { url = url
+                        , method = "GET"
+                        , headers = zoteroHeaders config.zoteroApiKey
+                        , body = BackendTask.Http.emptyBody
+                        , retries = Just 1
+                        , timeoutInMs = Just 30000
+                        }
+                        (BackendTask.Http.expectJson ZoteroApi.itemListDecoder)
+                        |> BackendTask.allowFatal
+                )
+
+     else
+        BackendTask.succeed []
+    )
+        -- Step 2: also fetch from version collections (for versions 1..current-1)
+        |> BackendTask.andThen
+            (\tagItems ->
+                fetchItemsFromCollections config collectionKeysToFetch limit tagItems
+            )
+
+
+fetchItemsFromCollections : Config -> List String -> Int -> List ZoteroApi.ZoteroItem -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
+fetchItemsFromCollections config collectionKeys limit acc =
+    case collectionKeys of
+        [] ->
+            BackendTask.succeed acc
+
+        key :: rest ->
+            let
+                remaining =
+                    limit - List.length acc
+
+                url =
+                    zoteroBaseUrl config.zoteroLibraryId
+                        ++ "/collections/"
+                        ++ key
+                        ++ "/items?limit="
+                        ++ String.fromInt (min 100 remaining)
+                        ++ "&itemType=-note"
+            in
+            if remaining <= 0 then
+                BackendTask.succeed acc
+
+            else
+                Script.log ("GET /collections/" ++ key ++ "/items (migration)")
+                    |> BackendTask.andThen
+                        (\_ ->
+                            BackendTask.Http.request
+                                { url = url
+                                , method = "GET"
+                                , headers = zoteroHeaders config.zoteroApiKey
+                                , body = BackendTask.Http.emptyBody
+                                , retries = Just 1
+                                , timeoutInMs = Just 30000
+                                }
+                                (BackendTask.Http.expectJson ZoteroApi.itemListDecoder)
+                                |> BackendTask.allowFatal
+                        )
+                    |> BackendTask.andThen
+                        (\items ->
+                            fetchItemsFromCollections config rest limit (acc ++ items)
+                        )
+
+
+{-| Migrate a single item: upgrade callNumber schema and create new note.
+No AI calls, no tag changes. Existing notes are kept for comparison — since
+the source of truth is now the structured callNumber data, old notes are
+harmless clutter that can be cleaned up later.
+-}
+migrateItem : Config -> Collections -> ZoteroApi.ZoteroItem -> BackendTask FatalError (Result String ())
+migrateItem config collections item =
+    -- First GET child notes so we can use note content for legacy migration
+    getChildNotes config item.key
+        |> andThenResult
+            (\childNotes ->
+                let
+                    reasoningNotes =
+                        List.filter ZoteroApi.isReasoningNote childNotes
+
+                    reasoningNoteHtml =
+                        reasoningNotes |> List.head |> Maybe.map .note
+
+                    appraisalData =
+                        resolveAppraisalDataWithNotes item reasoningNoteHtml
+
+                    callNumberJson =
+                        Appraisal.encode appraisalData
+                            |> Encode.encode 0
+
+                    -- Remove old version collection keys, add current
+                    allVersionKeys =
+                        Dict.values collections.versionKeys
+
+                    collectionsWithoutOldVersions =
+                        item.data.collections
+                            |> List.filter (\c -> not (List.member c allVersionKeys))
+
+                    newCollections =
+                        (collectionsWithoutOldVersions ++ [ collections.currentVersionKey ])
+                            |> dedup
+
+                    noteHtml =
+                        Appraisal.generateNoteHtml appraisalData
+                in
+                -- PATCH callNumber + collections (keep existing tags)
+                patchItem config item { tags = item.data.tags, collections = newCollections, callNumber = callNumberJson }
+                    -- Always create a new note; keep existing ones for comparison
+                    |> andThenResult (\_ -> createNote config item.key noteHtml)
+            )
+
+
+{-| Check if an item already has current schema version in callNumber.
+-}
+isAlreadyCurrentVersion : ZoteroApi.ZoteroItem -> Bool
+isAlreadyCurrentVersion item =
+    case Decode.decodeString Appraisal.decode item.data.callNumber of
+        Ok data ->
+            not (Appraisal.needsMigration data)
+
+        Err _ ->
+            False
+
+
+migrateAll : Config -> Collections -> Maybe Int -> Int -> BackendTask FatalError ()
+migrateAll config collections fromVersion maxArticles =
+    migrateAllHelper config collections fromVersion maxArticles 1 emptyStats
+
+
+migrateAllHelper : Config -> Collections -> Maybe Int -> Int -> Int -> Stats -> BackendTask FatalError ()
+migrateAllHelper config collections fromVersion maxArticles batchNum totalStats =
+    let
+        batchSize =
+            min 100
+                (if maxArticles > 0 then
+                    maxArticles - totalStats.processed
+
+                 else
+                    100
+                )
+
+        batchHeader =
+            "\n" ++ String.repeat 60 "=" ++ "\nMIGRATION BATCH " ++ String.fromInt batchNum ++ "\n" ++ String.repeat 60 "="
+    in
+    Script.log batchHeader
+        |> BackendTask.andThen (\_ -> fetchItemsForMigration config collections fromVersion batchSize)
+        |> BackendTask.map (List.filter (\item -> not (isAlreadyCurrentVersion item)))
+        |> BackendTask.andThen
+            (\items ->
+                Script.log ("\n🔄 Migrating " ++ String.fromInt (List.length items) ++ " articles...")
+                    |> BackendTask.andThen (\_ -> migrateBatch config collections items 1 (List.length items) emptyStats)
+            )
+        |> BackendTask.andThen
+            (\batchStats ->
+                let
+                    newTotal =
+                        Stats.addStats totalStats batchStats
+                in
+                Script.log (Stats.formatSummary ("📊 Migration batch " ++ String.fromInt batchNum) batchStats)
+                    |> BackendTask.andThen
+                        (\_ ->
+                            if batchStats.processed == 0 then
+                                Script.log "\n✓ All articles migrated!"
+                                    |> BackendTask.andThen (\_ -> printFinalSummary newTotal)
+
+                            else if maxArticles > 0 && newTotal.processed >= maxArticles then
+                                Script.log ("\n✓ Reached requested limit of " ++ String.fromInt maxArticles ++ " articles.")
+                                    |> BackendTask.andThen (\_ -> printFinalSummary newTotal)
+
+                            else
+                                Script.log "\nWaiting before next batch..."
+                                    |> BackendTask.andThen (\_ -> migrateAllHelper config collections fromVersion maxArticles (batchNum + 1) newTotal)
+                        )
+            )
+
+
+migrateBatch :
+    Config
+    -> Collections
+    -> List ZoteroApi.ZoteroItem
+    -> Int
+    -> Int
+    -> Stats
+    -> BackendTask FatalError Stats
+migrateBatch config collections items idx total stats =
+    case items of
+        [] ->
+            BackendTask.succeed stats
+
+        item :: rest ->
+            let
+                article =
+                    ZoteroApi.articleDataFromItem item
+            in
+            Script.log ("\n[" ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ "] " ++ String.left 60 article.title ++ "...")
+                |> BackendTask.andThen
+                    (\_ ->
+                        migrateItem config collections item
+                            |> BackendTask.andThen
+                                (\result ->
+                                    case result of
+                                        Ok _ ->
+                                            Script.log "  ✓ Migrated"
+                                                |> BackendTask.map (\_ -> ( { stats | processed = stats.processed + 1 }, Continue ))
+
+                                        Err errMsg ->
+                                            handleArticleError ("Migration failed — " ++ errMsg) stats
+                                )
+                    )
+                |> BackendTask.andThen
+                    (\( newStats, errAction ) ->
+                        case errAction of
+                            Abort ->
+                                logCircuitBreaker "\n⛔ Circuit breaker: 5 HTTP errors in under 1 minute — aborting" newStats
+                                    |> BackendTask.map (\_ -> newStats)
+
+                            PauseAndRetry ->
+                                logCircuitBreaker "\n⏸️  Circuit breaker: 5 HTTP errors in the last 5 minutes — taking a 5-minute break" newStats
+                                    |> BackendTask.andThen (\_ -> Script.sleep 300000)
+                                    |> BackendTask.andThen (\_ -> Script.log "\n▶️  Resuming after break...")
+                                    |> BackendTask.andThen (\_ -> migrateBatch config collections (item :: rest) idx total { newStats | recentErrorTimestamps = [] })
+
+                            Continue ->
+                                migrateBatch config collections rest (idx + 1) total newStats
+                    )
+
+
+
+-- Batch processing (classification)
 
 
 processAll : Config -> Collections -> Maybe String -> Int -> BackendTask FatalError ()
