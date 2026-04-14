@@ -4,6 +4,7 @@ import AnthropicApi
 import Appraisal
 import BackendTask exposing (BackendTask)
 import BackendTask.Env as Env
+import BackendTask.File
 import BackendTask.Http
 import BackendTask.Time
 import Classification
@@ -30,7 +31,13 @@ type alias Config =
     , zoteroApiKey : String
     , anthropicApiKey : String
     , anthropicModel : String
+    , systemPrompt : String
     }
+
+
+promptFile : String
+promptFile =
+    "prompt.txt"
 
 
 
@@ -237,6 +244,23 @@ loadConfig =
         (Env.expect "ZOTERO_API_KEY" |> BackendTask.allowFatal)
         (Env.expect "ANTHROPIC_API_KEY" |> BackendTask.allowFatal)
         (Env.expect "ANTHROPIC_MODEL" |> BackendTask.allowFatal)
+        |> BackendTask.andThen
+            (\partialConfig ->
+                loadPromptFile
+                    |> BackendTask.map (\prompt -> partialConfig prompt)
+            )
+
+
+loadPromptFile : BackendTask FatalError String
+loadPromptFile =
+    BackendTask.File.rawFile promptFile
+        |> BackendTask.onError
+            (\_ ->
+                BackendTask.fail
+                    (FatalError.fromString
+                        ("Missing prompt file: " ++ promptFile ++ "\nCreate this file in your project root with the system prompt for article classification.")
+                    )
+            )
 
 
 
@@ -596,7 +620,7 @@ classifyArticle config article =
             AnthropicApi.encodeMessageRequest
                 { model = config.anthropicModel
                 , maxTokens = 1000
-                , systemPrompt = Classification.systemPrompt
+                , systemPrompt = config.systemPrompt
                 , userMessage = userMessage
                 }
     in

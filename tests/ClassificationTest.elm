@@ -206,33 +206,6 @@ suite =
                         }
                         |> Expect.equal "TITLE: \n\nABSTRACT: \n\nKEYWORDS: "
             ]
-        , describe "systemPrompt"
-            [ test "contains key inclusion criteria" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "INCLUSION CRITERIA"
-                        |> Expect.equal True
-            , test "contains key exclusion criteria" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "EXCLUSION CRITERIA"
-                        |> Expect.equal True
-            , test "contains gene loci" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "DOCK8"
-                        |> Expect.equal True
-            , test "contains disease names" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "Wiskott-Aldrich"
-                        |> Expect.equal True
-            , test "requests JSON response format" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "Respond in JSON format"
-                        |> Expect.equal True
-            ]
         , describe "relevanceToInt"
             [ test "OneStar is 1" <|
                 \_ -> Classification.relevanceToInt OneStar |> Expect.equal 1
