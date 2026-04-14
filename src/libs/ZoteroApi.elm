@@ -8,6 +8,8 @@ module ZoteroApi exposing
     , buildNoteHtml
     , collectionDecoder
     , collectionListDecoder
+    , encodeBatchCreateNotes
+    , encodeBatchItemPatch
     , encodeCreateCollection
     , encodeCreateNote
     , encodeCreateSubCollection
@@ -230,6 +232,54 @@ encodeNotePatch noteHtml =
     Encode.object
         [ ( "note", Encode.string noteHtml )
         ]
+
+
+{-| Encode a batch of item updates for POST /items (multi-object write).
+Each item must include key and version for the server to apply the patch.
+-}
+encodeBatchItemPatch :
+    List
+        { key : String
+        , version : Int
+        , tags : List ZoteroTag
+        , collections : List String
+        , callNumber : String
+        }
+    -> Encode.Value
+encodeBatchItemPatch items =
+    Encode.list
+        (\item ->
+            Encode.object
+                [ ( "key", Encode.string item.key )
+                , ( "version", Encode.int item.version )
+                , ( "tags"
+                  , Encode.list
+                        (\t -> Encode.object [ ( "tag", Encode.string t.tag ) ])
+                        item.tags
+                  )
+                , ( "collections", Encode.list Encode.string item.collections )
+                , ( "callNumber", Encode.string item.callNumber )
+                ]
+        )
+        items
+
+
+{-| Encode a batch of new notes for POST /items (multi-object create).
+-}
+encodeBatchCreateNotes : List { parentItemKey : String, noteHtml : String } -> Encode.Value
+encodeBatchCreateNotes notes =
+    Encode.list
+        (\n ->
+            Encode.object
+                [ ( "itemType", Encode.string "note" )
+                , ( "note", Encode.string n.noteHtml )
+                , ( "parentItem", Encode.string n.parentItemKey )
+                , ( "tags", Encode.list identity [] )
+                , ( "collections", Encode.list identity [] )
+                , ( "relations", Encode.object [] )
+                ]
+        )
+        notes
 
 
 

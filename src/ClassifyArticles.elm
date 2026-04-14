@@ -40,6 +40,11 @@ promptFile =
     "prompt.txt"
 
 
+configFile : String
+configFile =
+    "config.txt"
+
+
 
 -- Constants
 
@@ -239,16 +244,110 @@ promptForMaxArticles =
 
 loadConfig : BackendTask FatalError Config
 loadConfig =
-    BackendTask.map4 Config
-        (Env.expect "ZOTERO_LIBRARY_ID" |> BackendTask.allowFatal)
-        (Env.expect "ZOTERO_API_KEY" |> BackendTask.allowFatal)
-        (Env.expect "ANTHROPIC_API_KEY" |> BackendTask.allowFatal)
-        (Env.expect "ANTHROPIC_MODEL" |> BackendTask.allowFatal)
+    loadConfigFile
+        |> BackendTask.andThen
+            (\fileVars ->
+                let
+                    resolveVar name =
+                        Env.get name
+                            |> BackendTask.map
+                                (\envVal ->
+                                    case envVal of
+                                        Just v ->
+                                            Ok v
+
+                                        Nothing ->
+                                            case Dict.get name fileVars of
+                                                Just v ->
+                                                    Ok v
+
+                                                Nothing ->
+                                                    Err name
+                                )
+                in
+                BackendTask.map4
+                    (\a b c d -> { libId = a, apiKey = b, anthropicKey = c, model = d })
+                    (resolveVar "ZOTERO_LIBRARY_ID")
+                    (resolveVar "ZOTERO_API_KEY")
+                    (resolveVar "ANTHROPIC_API_KEY")
+                    (resolveVar "ANTHROPIC_MODEL")
+            )
+        |> BackendTask.andThen
+            (\resolved ->
+                let
+                    missing =
+                        [ resolved.libId, resolved.apiKey, resolved.anthropicKey, resolved.model ]
+                            |> List.filterMap
+                                (\r ->
+                                    case r of
+                                        Err name ->
+                                            Just name
+
+                                        Ok _ ->
+                                            Nothing
+                                )
+                in
+                if List.isEmpty missing then
+                    case ( resolved.libId, resolved.apiKey ) of
+                        ( Ok a, Ok b ) ->
+                            case ( resolved.anthropicKey, resolved.model ) of
+                                ( Ok c, Ok d ) ->
+                                    BackendTask.succeed { zoteroLibraryId = a, zoteroApiKey = b, anthropicApiKey = c, anthropicModel = d, systemPrompt = "" }
+
+                                _ ->
+                                    BackendTask.fail (FatalError.fromString "Unexpected config error")
+
+                        _ ->
+                            BackendTask.fail (FatalError.fromString "Unexpected config error")
+
+                else
+                    BackendTask.fail
+                        (FatalError.fromString
+                            ("Missing configuration: "
+                                ++ String.join ", " missing
+                                ++ "\nSet them in your shell environment or in "
+                                ++ configFile
+                            )
+                        )
+            )
         |> BackendTask.andThen
             (\partialConfig ->
                 loadPromptFile
-                    |> BackendTask.map (\prompt -> partialConfig prompt)
+                    |> BackendTask.map (\prompt -> { partialConfig | systemPrompt = prompt })
             )
+
+
+{-| Parse config.txt as KEY=VALUE lines (ignoring comments and blank lines).
+-}
+loadConfigFile : BackendTask FatalError (Dict String String)
+loadConfigFile =
+    BackendTask.File.rawFile configFile
+        |> BackendTask.map parseConfigFile
+        |> BackendTask.onError (\_ -> BackendTask.succeed Dict.empty)
+
+
+parseConfigFile : String -> Dict String String
+parseConfigFile content =
+    content
+        |> String.lines
+        |> List.filterMap
+            (\line ->
+                let
+                    trimmed =
+                        String.trim line
+                in
+                if String.startsWith "#" trimmed || trimmed == "" then
+                    Nothing
+
+                else
+                    case String.split "=" trimmed of
+                        key :: rest ->
+                            Just ( String.trim key, String.trim (String.join "=" rest) )
+
+                        [] ->
+                            Nothing
+            )
+        |> Dict.fromList
 
 
 loadPromptFile : BackendTask FatalError String
@@ -587,20 +686,6 @@ patchNote config note newContent =
         (BackendTask.Http.expectWhatever ())
 
 
-deleteItem : Config -> String -> Int -> BackendTask FatalError (Result String ())
-deleteItem config itemKey version =
-    loggedRequest ("/items/" ++ itemKey)
-        { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items/" ++ itemKey
-        , method = "DELETE"
-        , headers =
-            ( "If-Unmodified-Since-Version", String.fromInt version )
-                :: zoteroHeaders config.zoteroApiKey
-        , body = BackendTask.Http.emptyBody
-        , retries = Nothing
-        , timeoutInMs = Just 30000
-        }
-        (BackendTask.Http.expectWhatever ())
-
 
 
 -- Anthropic API
@@ -836,41 +921,28 @@ dedup list =
         |> Tuple.second
 
 
-{-| Handle note creation or overwrite.
-The note is always fully regenerated from AppraisalData.
+{-| Handle note creation or update.
+Only touches the auto-generated note (identified by the disclaimer marker).
+Legacy reasoning notes and user-created notes are never modified or deleted.
 
-  - 0 existing reasoning notes → create new
-  - 1 existing reasoning note → overwrite with new content
-  - 2+ existing reasoning notes → overwrite first, delete extras
+  - No existing auto-generated note → create new
+  - Existing auto-generated note → overwrite with fresh content
 
 -}
 handleNotes : Config -> String -> List ZoteroApi.ZoteroNote -> String -> BackendTask FatalError (Result String ())
 handleNotes config parentItemKey childNotes noteHtml =
     let
-        reasoningNotes =
-            List.filter ZoteroApi.isReasoningNote childNotes
+        autoGeneratedNote =
+            childNotes
+                |> List.filter (\n -> String.contains "auto-generated from structured data" n.note)
+                |> List.head
     in
-    case reasoningNotes of
-        [] ->
+    case autoGeneratedNote of
+        Nothing ->
             createNote config parentItemKey noteHtml
 
-        [ single ] ->
-            patchNote config single noteHtml
-
-        first :: rest ->
-            patchNote config first noteHtml
-                |> andThenResult (\_ -> deleteExtraNotes config rest)
-
-
-deleteExtraNotes : Config -> List ZoteroApi.ZoteroNote -> BackendTask FatalError (Result String ())
-deleteExtraNotes config notes =
-    case notes of
-        [] ->
-            BackendTask.succeed (Ok ())
-
-        note :: rest ->
-            deleteItem config note.key note.version
-                |> andThenResult (\_ -> deleteExtraNotes config rest)
+        Just existing ->
+            patchNote config existing noteHtml
 
 
 
@@ -889,53 +961,13 @@ fetchItemsForMigration config collections fromVersion limit =
         startVersion =
             fromVersion |> Maybe.withDefault 0
 
-        -- Version 0 = legacy articles with CLAUDE tag but no version collection.
-        -- These can only be found by tag search, not by collection.
-        needsTagFetch =
-            startVersion <= 0
-
-        -- Versions 1+ have their own version collections
-        collectionVersionsToFetch =
-            List.range (max 1 startVersion) (Appraisal.currentSchemaVersion - 1)
-
+        -- Fetch from version collections startVersion..current-1
+        -- version_0 is manually populated with legacy articles
         collectionKeysToFetch =
-            collectionVersionsToFetch
+            List.range startVersion (Appraisal.currentSchemaVersion - 1)
                 |> List.filterMap (\v -> Dict.get v collections.versionKeys)
     in
-    -- Step 1: fetch legacy (tag-based) items if needed
-    (if needsTagFetch then
-        let
-            url =
-                zoteroBaseUrl config.zoteroLibraryId
-                    ++ "/items?tag="
-                    ++ processedTag
-                    ++ "&limit="
-                    ++ String.fromInt limit
-                    ++ "&itemType=-note"
-        in
-        Script.log ("GET /items?tag=" ++ processedTag ++ " (migration: legacy v0)")
-            |> BackendTask.andThen
-                (\_ ->
-                    BackendTask.Http.request
-                        { url = url
-                        , method = "GET"
-                        , headers = zoteroHeaders config.zoteroApiKey
-                        , body = BackendTask.Http.emptyBody
-                        , retries = Just 1
-                        , timeoutInMs = Just 30000
-                        }
-                        (BackendTask.Http.expectJson ZoteroApi.itemListDecoder)
-                        |> BackendTask.allowFatal
-                )
-
-     else
-        BackendTask.succeed []
-    )
-        -- Step 2: also fetch from version collections (for versions 1..current-1)
-        |> BackendTask.andThen
-            (\tagItems ->
-                fetchItemsFromCollections config collectionKeysToFetch limit tagItems
-            )
+    fetchItemsFromCollections config collectionKeysToFetch limit []
 
 
 fetchItemsFromCollections : Config -> List String -> Int -> List ZoteroApi.ZoteroItem -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
@@ -981,14 +1013,23 @@ fetchItemsFromCollections config collectionKeys limit acc =
                         )
 
 
-{-| Migrate a single item: upgrade callNumber schema and create new note.
-No AI calls, no tag changes. Existing notes are kept for comparison — since
-the source of truth is now the structured callNumber data, old notes are
-harmless clutter that can be cleaned up later.
+{-| Prepared migration data for a single item, ready for batch upload.
 -}
-migrateItem : Config -> Collections -> ZoteroApi.ZoteroItem -> BackendTask FatalError (Result String ())
-migrateItem config collections item =
-    -- First GET child notes so we can use note content for legacy migration
+type alias MigrationPatch =
+    { itemKey : String
+    , itemVersion : Int
+    , tags : List ZoteroApi.ZoteroTag
+    , collections : List String
+    , callNumber : String
+    , noteHtml : String
+    }
+
+
+{-| Prepare migration data for a single item by fetching child notes
+and computing the new callNumber and note HTML. No writes happen here.
+-}
+prepareMigrateItem : Config -> Collections -> ZoteroApi.ZoteroItem -> BackendTask FatalError (Result String MigrationPatch)
+prepareMigrateItem config collections item =
     getChildNotes config item.key
         |> andThenResult
             (\childNotes ->
@@ -1006,7 +1047,6 @@ migrateItem config collections item =
                         Appraisal.encode appraisalData
                             |> Encode.encode 0
 
-                    -- Remove old version collection keys, add current
                     allVersionKeys =
                         Dict.values collections.versionKeys
 
@@ -1017,15 +1057,68 @@ migrateItem config collections item =
                     newCollections =
                         (collectionsWithoutOldVersions ++ [ collections.currentVersionKey ])
                             |> dedup
-
-                    noteHtml =
-                        Appraisal.generateNoteHtml appraisalData
                 in
-                -- PATCH callNumber + collections (keep existing tags)
-                patchItem config item { tags = item.data.tags, collections = newCollections, callNumber = callNumberJson }
-                    -- Always create a new note; keep existing ones for comparison
-                    |> andThenResult (\_ -> createNote config item.key noteHtml)
+                BackendTask.succeed
+                    (Ok
+                        { itemKey = item.key
+                        , itemVersion = item.version
+                        , tags = item.data.tags
+                        , collections = newCollections
+                        , callNumber = callNumberJson
+                        , noteHtml = Appraisal.generateNoteHtml appraisalData
+                        }
+                    )
             )
+
+
+{-| Send a batch of item patches via POST /items (max 50 per request).
+-}
+batchPatchItems : Config -> List MigrationPatch -> BackendTask FatalError (Result String ())
+batchPatchItems config patches =
+    let
+        encoded =
+            ZoteroApi.encodeBatchItemPatch
+                (List.map
+                    (\p ->
+                        { key = p.itemKey
+                        , version = p.itemVersion
+                        , tags = p.tags
+                        , collections = p.collections
+                        , callNumber = p.callNumber
+                        }
+                    )
+                    patches
+                )
+    in
+    loggedRequest ("POST /items (batch update " ++ String.fromInt (List.length patches) ++ " items)")
+        { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items"
+        , method = "POST"
+        , headers = zoteroHeaders config.zoteroApiKey
+        , body = BackendTask.Http.jsonBody encoded
+        , retries = Nothing
+        , timeoutInMs = Just 60000
+        }
+        (BackendTask.Http.expectWhatever ())
+
+
+{-| Send a batch of new notes via POST /items (max 50 per request).
+-}
+batchCreateNotes : Config -> List MigrationPatch -> BackendTask FatalError (Result String ())
+batchCreateNotes config patches =
+    let
+        encoded =
+            ZoteroApi.encodeBatchCreateNotes
+                (List.map (\p -> { parentItemKey = p.itemKey, noteHtml = p.noteHtml }) patches)
+    in
+    loggedRequest ("POST /items (batch create " ++ String.fromInt (List.length patches) ++ " notes)")
+        { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items"
+        , method = "POST"
+        , headers = zoteroHeaders config.zoteroApiKey
+        , body = BackendTask.Http.jsonBody encoded
+        , retries = Nothing
+        , timeoutInMs = Just 60000
+        }
+        (BackendTask.Http.expectWhatever ())
 
 
 {-| Check if an item already has current schema version in callNumber.
@@ -1065,8 +1158,12 @@ migrateAllHelper config collections fromVersion maxArticles batchNum totalStats 
         |> BackendTask.map (List.filter (\item -> not (isAlreadyCurrentVersion item)))
         |> BackendTask.andThen
             (\items ->
-                Script.log ("\n🔄 Migrating " ++ String.fromInt (List.length items) ++ " articles...")
-                    |> BackendTask.andThen (\_ -> migrateBatch config collections items 1 (List.length items) emptyStats)
+                let
+                    count =
+                        List.length items
+                in
+                Script.log ("\n🔄 Migrating " ++ String.fromInt count ++ " articles...")
+                    |> BackendTask.andThen (\_ -> migrateBatch config collections items emptyStats)
             )
         |> BackendTask.andThen
             (\batchStats ->
@@ -1092,55 +1189,113 @@ migrateAllHelper config collections fromVersion maxArticles batchNum totalStats 
             )
 
 
+{-| Migrate a batch of items: prepare patches one-by-one (fetching child notes),
+then upload in bulk via Zotero's multi-object write API (up to 50 per request).
+-}
 migrateBatch :
+    Config
+    -> Collections
+    -> List ZoteroApi.ZoteroItem
+    -> Stats
+    -> BackendTask FatalError Stats
+migrateBatch config collections items stats =
+    -- Step 1: prepare all patches (sequential, since each needs a child notes GET)
+    prepareMigrationPatches config collections items 1 (List.length items) []
+        |> BackendTask.andThen
+            (\patches ->
+                let
+                    patchCount =
+                        List.length patches
+
+                    failCount =
+                        List.length items - patchCount
+                in
+                -- Step 2: batch upload in chunks of 50
+                sendMigrationChunks config patches
+                    |> BackendTask.map
+                        (\writeResult ->
+                            case writeResult of
+                                Ok _ ->
+                                    { stats
+                                        | processed = stats.processed + patchCount
+                                        , errors = stats.errors + failCount
+                                    }
+
+                                Err _ ->
+                                    { stats
+                                        | errors = stats.errors + List.length items
+                                    }
+                        )
+            )
+
+
+{-| Prepare migration patches for each item sequentially (each needs a child notes GET).
+-}
+prepareMigrationPatches :
     Config
     -> Collections
     -> List ZoteroApi.ZoteroItem
     -> Int
     -> Int
-    -> Stats
-    -> BackendTask FatalError Stats
-migrateBatch config collections items idx total stats =
+    -> List MigrationPatch
+    -> BackendTask FatalError (List MigrationPatch)
+prepareMigrationPatches config collections items idx total acc =
     case items of
         [] ->
-            BackendTask.succeed stats
+            BackendTask.succeed (List.reverse acc)
 
         item :: rest ->
             let
                 article =
                     ZoteroApi.articleDataFromItem item
             in
-            Script.log ("\n[" ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ "] " ++ String.left 60 article.title ++ "...")
+            Script.log ("[" ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ "] Preparing: " ++ String.left 60 article.title ++ "...")
+                |> BackendTask.andThen (\_ -> prepareMigrateItem config collections item)
                 |> BackendTask.andThen
-                    (\_ ->
-                        migrateItem config collections item
-                            |> BackendTask.andThen
-                                (\result ->
-                                    case result of
-                                        Ok _ ->
-                                            Script.log "  ✓ Migrated"
-                                                |> BackendTask.map (\_ -> ( { stats | processed = stats.processed + 1 }, Continue ))
+                    (\result ->
+                        case result of
+                            Ok patch ->
+                                prepareMigrationPatches config collections rest (idx + 1) total (patch :: acc)
 
-                                        Err errMsg ->
-                                            handleArticleError ("Migration failed — " ++ errMsg) stats
-                                )
+                            Err errMsg ->
+                                Script.log ("  ⚠ Skipped: " ++ errMsg)
+                                    |> BackendTask.andThen (\_ -> prepareMigrationPatches config collections rest (idx + 1) total acc)
                     )
-                |> BackendTask.andThen
-                    (\( newStats, errAction ) ->
-                        case errAction of
-                            Abort ->
-                                logCircuitBreaker "\n⛔ Circuit breaker: 5 HTTP errors in under 1 minute — aborting" newStats
-                                    |> BackendTask.map (\_ -> newStats)
 
-                            PauseAndRetry ->
-                                logCircuitBreaker "\n⏸️  Circuit breaker: 5 HTTP errors in the last 5 minutes — taking a 5-minute break" newStats
-                                    |> BackendTask.andThen (\_ -> Script.sleep 300000)
-                                    |> BackendTask.andThen (\_ -> Script.log "\n▶️  Resuming after break...")
-                                    |> BackendTask.andThen (\_ -> migrateBatch config collections (item :: rest) idx total { newStats | recentErrorTimestamps = [] })
 
-                            Continue ->
-                                migrateBatch config collections rest (idx + 1) total newStats
-                    )
+{-| Send prepared patches to Zotero in chunks of 50 (item updates, then note creates).
+-}
+sendMigrationChunks : Config -> List MigrationPatch -> BackendTask FatalError (Result String ())
+sendMigrationChunks config patches =
+    let
+        chunks =
+            chunk 50 patches
+    in
+    sendChunksHelper config chunks 1 (List.length chunks)
+
+
+sendChunksHelper : Config -> List (List MigrationPatch) -> Int -> Int -> BackendTask FatalError (Result String ())
+sendChunksHelper config chunks idx total =
+    case chunks of
+        [] ->
+            BackendTask.succeed (Ok ())
+
+        batch :: rest ->
+            Script.log ("\n📤 Uploading chunk " ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ " (" ++ String.fromInt (List.length batch) ++ " items)...")
+                |> BackendTask.andThen (\_ -> batchPatchItems config batch)
+                |> andThenResult (\_ -> batchCreateNotes config batch)
+                |> andThenResult (\_ -> sendChunksHelper config rest (idx + 1) total)
+
+
+{-| Split a list into chunks of at most n elements.
+-}
+chunk : Int -> List a -> List (List a)
+chunk n list =
+    if List.isEmpty list then
+        []
+
+    else
+        List.take n list :: chunk n (List.drop n list)
 
 
 

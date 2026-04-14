@@ -12,8 +12,9 @@ The one where we stopped trusting HTML notes and started putting real data in re
 
 ### Migration Mode
 - New `--migrate` flag for upgrading legacy articles to structured format without making AI calls
-- `--migrate 0` targets legacy (v0) articles found by CLAUDE tag; `--migrate N` targets articles in version N collections
-- Existing notes preserved for comparison — old notes kept as harmless clutter alongside new structured ones
+- `--migrate 0` targets articles in the `version_0` collection; `--migrate N` targets articles in version N collections
+- Batch writes via Zotero's multi-object API — up to 50 items per request instead of one-by-one
+- Existing notes preserved for comparison — old notes are never modified or deleted
 - Hardened Todo extraction from legacy HTML: multi-paragraph, inline, and div-wrapped variants now handled correctly
 
 ### Version Collection Tracking
@@ -25,12 +26,17 @@ The one where we stopped trusting HTML notes and started putting real data in re
 - Loaded at runtime via `BackendTask.File` — iterate on prompts without recompiling
 - Clear error message if prompt file is missing
 
+### Configuration
+- Environment variables now fall back to `config.txt` if not set in the shell — same `KEY=VALUE` format as `.env_template`
+- Helpful error messages listing exactly which variables are missing and where to set them
+
 ### Housekeeping
+- Notes are never deleted or overwritten — only auto-generated notes are updated, user notes are untouched
 - Fixed elm-review false positive on elm-pages entry module export
 - Removed unused `Config` parameter from `parseClassificationResponse`
 - Added `parentCollection` support to `ZoteroCollection` type and decoder (handles Zotero's quirky `false` vs string response)
-- Added `encodeCreateSubCollection` for creating child collections
-- 145 tests passing, zero elm-review errors
+- Added `encodeCreateSubCollection` and batch write encoders for multi-object API
+- 144 tests passing, zero elm-review errors
 
 ## v0.1.1 — The Paperwork Release
 

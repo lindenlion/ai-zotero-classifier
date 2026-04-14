@@ -15,16 +15,18 @@ An automated tool that screens PubMed articles in your Zotero library using Clau
 
 Download `ai-zotero-classifier_0.1.1.mjs` from the `build/` folder (or from the [Releases](https://github.com/lindenlion/ai-zotero-classifier/releases) page).
 
-### 2. Set environment variables
+### 2. Configure
 
-The script needs four environment variables. Set them in your terminal before running:
+The script needs four variables. You can set them as environment variables or put them in a `config.txt` file (same format as `.env_template`):
 
-```bash
-export ZOTERO_LIBRARY_ID="your_library_id"
-export ZOTERO_API_KEY="your_zotero_api_key"
-export ANTHROPIC_API_KEY="your_anthropic_api_key"
-export ANTHROPIC_MODEL="claude-sonnet-4-6"
 ```
+ZOTERO_LIBRARY_ID=your_library_id
+ZOTERO_API_KEY=your_zotero_api_key
+ANTHROPIC_API_KEY=your_anthropic_api_key
+ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
+Environment variables take precedence over `config.txt`. The script checks both and tells you exactly which variables are missing.
 
 - **ZOTERO_LIBRARY_ID** -- Your Zotero user or group library ID. Find it at https://www.zotero.org/mylibrary (the first number in the url).
 - **ZOTERO_API_KEY** -- Create a new key at https://www.zotero.org/settings/keys/new. Grant it "Allow library access" with read/write permissions and "Allow notes access".

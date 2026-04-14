@@ -278,6 +278,72 @@ suite =
                         encoded
                         |> Expect.equal (Ok "<p>Updated</p>")
             ]
+        , describe "encodeBatchItemPatch"
+            [ test "encodes multiple items with key and version" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchItemPatch
+                                [ { key = "A1", version = 10, tags = [ { tag = "CLAUDE" } ], collections = [ "COL1" ], callNumber = "{\"v\":1}" }
+                                , { key = "B2", version = 20, tags = [], collections = [], callNumber = "{\"v\":1}" }
+                                ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.list
+                            (Decode.map2 Tuple.pair
+                                (Decode.field "key" Decode.string)
+                                (Decode.field "version" Decode.int)
+                            )
+                        )
+                        encoded
+                        |> Expect.equal (Ok [ ( "A1", 10 ), ( "B2", 20 ) ])
+            , test "includes callNumber in each item" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchItemPatch
+                                [ { key = "X", version = 1, tags = [], collections = [], callNumber = "{\"v\":1}" } ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.index 0 (Decode.field "callNumber" Decode.string))
+                        encoded
+                        |> Expect.equal (Ok "{\"v\":1}")
+            ]
+        , describe "encodeBatchCreateNotes"
+            [ test "encodes multiple notes with parentItem" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchCreateNotes
+                                [ { parentItemKey = "P1", noteHtml = "<p>Note 1</p>" }
+                                , { parentItemKey = "P2", noteHtml = "<p>Note 2</p>" }
+                                ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.list
+                            (Decode.map2 Tuple.pair
+                                (Decode.field "parentItem" Decode.string)
+                                (Decode.field "note" Decode.string)
+                            )
+                        )
+                        encoded
+                        |> Expect.equal (Ok [ ( "P1", "<p>Note 1</p>" ), ( "P2", "<p>Note 2</p>" ) ])
+            , test "each note has itemType note" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchCreateNotes
+                                [ { parentItemKey = "P1", noteHtml = "<p>Hi</p>" } ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.index 0 (Decode.field "itemType" Decode.string))
+                        encoded
+                        |> Expect.equal (Ok "note")
+            ]
         , describe "noteListDecoder"
             [ test "decodes child notes" <|
                 \_ ->
