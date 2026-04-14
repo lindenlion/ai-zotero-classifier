@@ -47,6 +47,32 @@ suite =
                     Decode.decodeString ZoteroApi.itemDecoder json
                         |> Result.map (\item -> ( item.data.title, item.data.abstractNote ))
                         |> Expect.equal (Ok ( "No title", "No abstract available" ))
+            , test "decodes callNumber when present" <|
+                \_ ->
+                    let
+                        json =
+                            """
+                            {
+                                "key": "CN1",
+                                "version": 1,
+                                "data": {
+                                    "callNumber": "{\\"v\\":1}"
+                                }
+                            }
+                            """
+                    in
+                    Decode.decodeString ZoteroApi.itemDecoder json
+                        |> Result.map (.data >> .callNumber)
+                        |> Expect.equal (Ok "{\"v\":1}")
+            , test "defaults callNumber to empty string when absent" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "CN2", "version": 1, "data": {}}"""
+                    in
+                    Decode.decodeString ZoteroApi.itemDecoder json
+                        |> Result.map (.data >> .callNumber)
+                        |> Expect.equal (Ok "")
             , test "decodes item version as int" <|
                 \_ ->
                     let
@@ -74,14 +100,30 @@ suite =
                         |> Expect.equal (Ok 2)
             ]
         , describe "collectionDecoder"
-            [ test "decodes a collection" <|
+            [ test "decodes a collection without parentCollection" <|
                 \_ ->
                     let
                         json =
                             """{"key": "COL1", "data": {"name": "Claude included"}}"""
                     in
                     Decode.decodeString ZoteroApi.collectionDecoder json
-                        |> Expect.equal (Ok { key = "COL1", name = "Claude included" })
+                        |> Expect.equal (Ok { key = "COL1", name = "Claude included", parentCollection = "" })
+            , test "decodes a collection with parentCollection string" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "SUB1", "data": {"name": "version_1", "parentCollection": "PARENT_KEY"}}"""
+                    in
+                    Decode.decodeString ZoteroApi.collectionDecoder json
+                        |> Expect.equal (Ok { key = "SUB1", name = "version_1", parentCollection = "PARENT_KEY" })
+            , test "decodes a collection with parentCollection false (top-level)" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "TOP1", "data": {"name": "Top level", "parentCollection": false}}"""
+                    in
+                    Decode.decodeString ZoteroApi.collectionDecoder json
+                        |> Expect.equal (Ok { key = "TOP1", name = "Top level", parentCollection = "" })
             ]
         , describe "collectionListDecoder"
             [ test "decodes list of collections" <|
@@ -107,6 +149,7 @@ suite =
                                 , tags = [ { tag = "kw1" }, { tag = "kw2" } ]
                                 , collections = []
                                 , itemType = "journalArticle"
+                                , callNumber = ""
                                 }
                             }
 
@@ -133,6 +176,7 @@ suite =
                                 , tags = []
                                 , collections = []
                                 , itemType = "journalArticle"
+                                , callNumber = ""
                                 }
                             }
                     in
@@ -152,6 +196,24 @@ suite =
                         (Decode.index 0 (Decode.field "name" Decode.string))
                         encoded
                         |> Expect.equal (Ok "My Collection")
+            ]
+        , describe "encodeCreateSubCollection"
+            [ test "encodes sub-collection with parent key" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeCreateSubCollection "version_1" "PARENT_KEY"
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.index 0
+                            (Decode.map2 Tuple.pair
+                                (Decode.field "name" Decode.string)
+                                (Decode.field "parentCollection" Decode.string)
+                            )
+                        )
+                        encoded
+                        |> Expect.equal (Ok ( "version_1", "PARENT_KEY" ))
             ]
         , describe "encodeCreateNote"
             [ test "encodes note with parent item" <|
@@ -183,23 +245,25 @@ suite =
                         |> Expect.equal (Ok "<p>Hello</p>")
             ]
         , describe "encodeItemPatch"
-            [ test "encodes tags and collections together" <|
+            [ test "encodes tags, collections, and callNumber together" <|
                 \_ ->
                     let
                         encoded =
                             ZoteroApi.encodeItemPatch
                                 { tags = [ { tag = "CLAUDE" }, { tag = "⭐⭐⭐" } ]
                                 , collections = [ "COL1", "COL2" ]
+                                , callNumber = "{\"v\":1}"
                                 }
                                 |> Encode.encode 0
                     in
                     Decode.decodeString
-                        (Decode.map2 Tuple.pair
+                        (Decode.map3 (\t c cn -> ( t, c, cn ))
                             (Decode.field "tags" (Decode.list (Decode.field "tag" Decode.string)))
                             (Decode.field "collections" (Decode.list Decode.string))
+                            (Decode.field "callNumber" Decode.string)
                         )
                         encoded
-                        |> Expect.equal (Ok ( [ "CLAUDE", "⭐⭐⭐" ], [ "COL1", "COL2" ] ))
+                        |> Expect.equal (Ok ( [ "CLAUDE", "⭐⭐⭐" ], [ "COL1", "COL2" ], "{\"v\":1}" ))
             ]
         , describe "encodeNotePatch"
             [ test "encodes note content" <|
@@ -213,6 +277,72 @@ suite =
                         (Decode.field "note" Decode.string)
                         encoded
                         |> Expect.equal (Ok "<p>Updated</p>")
+            ]
+        , describe "encodeBatchItemPatch"
+            [ test "encodes multiple items with key and version" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchItemPatch
+                                [ { key = "A1", version = 10, tags = [ { tag = "CLAUDE" } ], collections = [ "COL1" ], callNumber = "{\"v\":1}" }
+                                , { key = "B2", version = 20, tags = [], collections = [], callNumber = "{\"v\":1}" }
+                                ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.list
+                            (Decode.map2 Tuple.pair
+                                (Decode.field "key" Decode.string)
+                                (Decode.field "version" Decode.int)
+                            )
+                        )
+                        encoded
+                        |> Expect.equal (Ok [ ( "A1", 10 ), ( "B2", 20 ) ])
+            , test "includes callNumber in each item" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchItemPatch
+                                [ { key = "X", version = 1, tags = [], collections = [], callNumber = "{\"v\":1}" } ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.index 0 (Decode.field "callNumber" Decode.string))
+                        encoded
+                        |> Expect.equal (Ok "{\"v\":1}")
+            ]
+        , describe "encodeBatchCreateNotes"
+            [ test "encodes multiple notes with parentItem" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchCreateNotes
+                                [ { parentItemKey = "P1", noteHtml = "<p>Note 1</p>" }
+                                , { parentItemKey = "P2", noteHtml = "<p>Note 2</p>" }
+                                ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.list
+                            (Decode.map2 Tuple.pair
+                                (Decode.field "parentItem" Decode.string)
+                                (Decode.field "note" Decode.string)
+                            )
+                        )
+                        encoded
+                        |> Expect.equal (Ok [ ( "P1", "<p>Note 1</p>" ), ( "P2", "<p>Note 2</p>" ) ])
+            , test "each note has itemType note" <|
+                \_ ->
+                    let
+                        encoded =
+                            ZoteroApi.encodeBatchCreateNotes
+                                [ { parentItemKey = "P1", noteHtml = "<p>Hi</p>" } ]
+                                |> Encode.encode 0
+                    in
+                    Decode.decodeString
+                        (Decode.index 0 (Decode.field "itemType" Decode.string))
+                        encoded
+                        |> Expect.equal (Ok "note")
             ]
         , describe "noteListDecoder"
             [ test "decodes child notes" <|
@@ -251,6 +381,11 @@ suite =
                     ZoteroApi.isReasoningNote
                         { key = "N4", version = 1, note = "" }
                         |> Expect.equal False
+            , test "identifies auto-generated note" <|
+                \_ ->
+                    ZoteroApi.isReasoningNote
+                        { key = "N5", version = 1, note = "<p><em>This note is auto-generated from structured data</em></p>" }
+                        |> Expect.equal True
             ]
         , describe "buildNoteHtml"
             [ test "include note contains Todo and Inclusion reasoning" <|

@@ -21,6 +21,7 @@ config =
     , NoUnused.CustomTypeConstructorArgs.rule
     , NoUnused.Dependencies.rule
     , NoUnused.Exports.rule
+        |> Review.Rule.ignoreErrorsForFiles [ "src/ClassifyArticles.elm" ]
     , NoUnused.Parameters.rule
     , NoUnused.Patterns.rule
     , NoUnused.Variables.rule

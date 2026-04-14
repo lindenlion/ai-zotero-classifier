@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.2.0 — The Great Migration
+
+The one where we stopped trusting HTML notes and started putting real data in real fields.
+
+### Structured Appraisal Data
+- Classification results now stored as structured JSON in Zotero's `callNumber` field — the source of truth has left the HTML building
+- Multi-provider support: appraisals keyed by provider name (e.g. "claude", "deepseek"), ready for the day we let multiple AIs argue about immunology papers
+- ASReview data slot for human-in-the-loop integration
+- Schema versioning (currently v1) with forward migration support
+
+### Migration Mode
+- New `--migrate` flag for upgrading legacy articles to structured format without making AI calls
+- `--migrate 0` targets articles in the `version_0` collection; `--migrate N` targets articles in version N collections
+- Batch writes via Zotero's multi-object API — up to 50 items per request instead of one-by-one
+- Existing notes preserved for comparison — old notes are never modified or deleted
+- Hardened Todo extraction from legacy HTML: multi-paragraph, inline, and div-wrapped variants now handled correctly
+
+### Version Collection Tracking
+- Articles tracked in Zotero sub-collections (`data_schema_migrations/version_N`) for efficient future upgrades
+- Classification mode automatically manages version collections alongside relevant/irrelevant sorting
+
+### External Prompt
+- System prompt moved from hardcoded Elm string to external `prompt.txt` file
+- Loaded at runtime via `BackendTask.File` — iterate on prompts without recompiling
+- Clear error message if prompt file is missing
+
+### Configuration
+- Environment variables now fall back to `config.txt` if not set in the shell — same `KEY=VALUE` format as `.env_template`
+- Helpful error messages listing exactly which variables are missing and where to set them
+
+### Housekeeping
+- Notes are never deleted or overwritten — only auto-generated notes are updated, user notes are untouched
+- Fixed elm-review false positive on elm-pages entry module export
+- Removed unused `Config` parameter from `parseClassificationResponse`
+- Added `parentCollection` support to `ZoteroCollection` type and decoder (handles Zotero's quirky `false` vs string response)
+- Added `encodeCreateSubCollection` and batch write encoders for multi-object API
+- Fixed legacy migration hardcoding `isRefusal = False` instead of checking the migrated content
+- 145 tests passing, zero elm-review errors
+
 ## v0.1.1 — The Paperwork Release
 
 The code didn't change, but the documentation got a makeover worthy of a journal resubmission.

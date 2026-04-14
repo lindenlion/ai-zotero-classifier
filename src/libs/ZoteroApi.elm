@@ -8,8 +8,11 @@ module ZoteroApi exposing
     , buildNoteHtml
     , collectionDecoder
     , collectionListDecoder
+    , encodeBatchCreateNotes
+    , encodeBatchItemPatch
     , encodeCreateCollection
     , encodeCreateNote
+    , encodeCreateSubCollection
     , encodeItemPatch
     , encodeNotePatch
     , isReasoningNote
@@ -40,12 +43,14 @@ type alias ZoteroItemData =
     , tags : List ZoteroTag
     , collections : List String
     , itemType : String
+    , callNumber : String
     }
 
 
 type alias ZoteroCollection =
     { key : String
     , name : String
+    , parentCollection : String
     }
 
 
@@ -77,7 +82,17 @@ tagDecoder =
 
 itemDataDecoder : Decoder ZoteroItemData
 itemDataDecoder =
-    Decode.map5 ZoteroItemData
+    Decode.map5
+        (\title abstract tags collections itemType ->
+            \callNum ->
+                { title = title
+                , abstractNote = abstract
+                , tags = tags
+                , collections = collections
+                , itemType = itemType
+                , callNumber = callNum
+                }
+        )
         (Decode.field "title" Decode.string
             |> Decode.maybe
             |> Decode.map (Maybe.withDefault "No title")
@@ -98,6 +113,13 @@ itemDataDecoder =
             |> Decode.maybe
             |> Decode.map (Maybe.withDefault "")
         )
+        |> Decode.andThen
+            (\partialFn ->
+                Decode.field "callNumber" Decode.string
+                    |> Decode.maybe
+                    |> Decode.map (Maybe.withDefault "")
+                    |> Decode.map partialFn
+            )
 
 
 itemDecoder : Decoder ZoteroItem
@@ -128,9 +150,18 @@ noteListDecoder =
 
 collectionDecoder : Decoder ZoteroCollection
 collectionDecoder =
-    Decode.map2 ZoteroCollection
+    Decode.map3 ZoteroCollection
         (Decode.field "key" Decode.string)
         (Decode.at [ "data", "name" ] Decode.string)
+        (Decode.at [ "data", "parentCollection" ]
+            (Decode.oneOf
+                [ Decode.string
+                , Decode.succeed ""
+                ]
+            )
+            |> Decode.maybe
+            |> Decode.map (Maybe.withDefault "")
+        )
 
 
 collectionListDecoder : Decoder (List ZoteroCollection)
@@ -151,9 +182,19 @@ encodeCreateCollection name =
         ]
 
 
-{-| Encode a PATCH body that updates both tags and collections in one request.
+encodeCreateSubCollection : String -> String -> Encode.Value
+encodeCreateSubCollection name parentKey =
+    Encode.list identity
+        [ Encode.object
+            [ ( "name", Encode.string name )
+            , ( "parentCollection", Encode.string parentKey )
+            ]
+        ]
+
+
+{-| Encode a PATCH body that updates tags, collections, and callNumber in one request.
 -}
-encodeItemPatch : { tags : List ZoteroTag, collections : List String } -> Encode.Value
+encodeItemPatch : { tags : List ZoteroTag, collections : List String, callNumber : String } -> Encode.Value
 encodeItemPatch patch =
     Encode.object
         [ ( "tags"
@@ -163,6 +204,9 @@ encodeItemPatch patch =
           )
         , ( "collections"
           , Encode.list Encode.string patch.collections
+          )
+        , ( "callNumber"
+          , Encode.string patch.callNumber
           )
         ]
 
@@ -190,6 +234,54 @@ encodeNotePatch noteHtml =
         ]
 
 
+{-| Encode a batch of item updates for POST /items (multi-object write).
+Each item must include key and version for the server to apply the patch.
+-}
+encodeBatchItemPatch :
+    List
+        { key : String
+        , version : Int
+        , tags : List ZoteroTag
+        , collections : List String
+        , callNumber : String
+        }
+    -> Encode.Value
+encodeBatchItemPatch items =
+    Encode.list
+        (\item ->
+            Encode.object
+                [ ( "key", Encode.string item.key )
+                , ( "version", Encode.int item.version )
+                , ( "tags"
+                  , Encode.list
+                        (\t -> Encode.object [ ( "tag", Encode.string t.tag ) ])
+                        item.tags
+                  )
+                , ( "collections", Encode.list Encode.string item.collections )
+                , ( "callNumber", Encode.string item.callNumber )
+                ]
+        )
+        items
+
+
+{-| Encode a batch of new notes for POST /items (multi-object create).
+-}
+encodeBatchCreateNotes : List { parentItemKey : String, noteHtml : String } -> Encode.Value
+encodeBatchCreateNotes notes =
+    Encode.list
+        (\n ->
+            Encode.object
+                [ ( "itemType", Encode.string "note" )
+                , ( "note", Encode.string n.noteHtml )
+                , ( "parentItem", Encode.string n.parentItemKey )
+                , ( "tags", Encode.list identity [] )
+                , ( "collections", Encode.list identity [] )
+                , ( "relations", Encode.object [] )
+                ]
+        )
+        notes
+
+
 
 -- Helpers
 
@@ -198,6 +290,7 @@ isReasoningNote : ZoteroNote -> Bool
 isReasoningNote note =
     String.contains "Inclusion reasoning" note.note
         || String.contains "Exclusion reasoning" note.note
+        || String.contains "auto-generated from structured data" note.note
 
 
 {-| Build the HTML content for a reasoning note.

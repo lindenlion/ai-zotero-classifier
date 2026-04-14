@@ -187,6 +187,15 @@ suite =
                         , deathAfterTherapy = False
                         }
                         |> Expect.equal False
+            , test "detects refusal by 'Needs human screening.' note" <|
+                \_ ->
+                    Classification.isRefusal
+                        { relevance = FourStars
+                        , reasoning = "Normal-looking reasoning"
+                        , note = "Needs human screening."
+                        , deathAfterTherapy = False
+                        }
+                        |> Expect.equal True
             ]
         , describe "userPrompt"
             [ test "formats title, abstract, keywords" <|
@@ -206,31 +215,32 @@ suite =
                         }
                         |> Expect.equal "TITLE: \n\nABSTRACT: \n\nKEYWORDS: "
             ]
-        , describe "systemPrompt"
-            [ test "contains key inclusion criteria" <|
+        , describe "relevanceToInt"
+            [ test "OneStar is 1" <|
+                \_ -> Classification.relevanceToInt OneStar |> Expect.equal 1
+            , test "TwoStars is 2" <|
+                \_ -> Classification.relevanceToInt TwoStars |> Expect.equal 2
+            , test "ThreeStars is 3" <|
+                \_ -> Classification.relevanceToInt ThreeStars |> Expect.equal 3
+            , test "FourStars is 4" <|
+                \_ -> Classification.relevanceToInt FourStars |> Expect.equal 4
+            , test "FiveStars is 5" <|
+                \_ -> Classification.relevanceToInt FiveStars |> Expect.equal 5
+            ]
+        , describe "intToRelevance"
+            [ test "1 is OneStar" <|
+                \_ -> Classification.intToRelevance 1 |> Expect.equal (Just OneStar)
+            , test "5 is FiveStars" <|
+                \_ -> Classification.intToRelevance 5 |> Expect.equal (Just FiveStars)
+            , test "0 is Nothing" <|
+                \_ -> Classification.intToRelevance 0 |> Expect.equal Nothing
+            , test "6 is Nothing" <|
+                \_ -> Classification.intToRelevance 6 |> Expect.equal Nothing
+            , test "roundtrip for all relevances" <|
                 \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "INCLUSION CRITERIA"
-                        |> Expect.equal True
-            , test "contains key exclusion criteria" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "EXCLUSION CRITERIA"
-                        |> Expect.equal True
-            , test "contains gene loci" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "DOCK8"
-                        |> Expect.equal True
-            , test "contains disease names" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "Wiskott-Aldrich"
-                        |> Expect.equal True
-            , test "requests JSON response format" <|
-                \_ ->
-                    Classification.systemPrompt
-                        |> String.contains "Respond in JSON format"
-                        |> Expect.equal True
+                    [ OneStar, TwoStars, ThreeStars, FourStars, FiveStars ]
+                        |> List.map (\r -> Classification.relevanceToInt r |> Classification.intToRelevance)
+                        |> Expect.equal
+                            [ Just OneStar, Just TwoStars, Just ThreeStars, Just FourStars, Just FiveStars ]
             ]
         ]
