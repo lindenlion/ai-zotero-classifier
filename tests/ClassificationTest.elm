@@ -187,6 +187,15 @@ suite =
                         , deathAfterTherapy = False
                         }
                         |> Expect.equal False
+            , test "detects refusal by 'Needs human screening.' note" <|
+                \_ ->
+                    Classification.isRefusal
+                        { relevance = FourStars
+                        , reasoning = "Normal-looking reasoning"
+                        , note = "Needs human screening."
+                        , deathAfterTherapy = False
+                        }
+                        |> Expect.equal True
             ]
         , describe "userPrompt"
             [ test "formats title, abstract, keywords" <|

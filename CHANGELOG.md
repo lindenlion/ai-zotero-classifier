@@ -36,7 +36,8 @@ The one where we stopped trusting HTML notes and started putting real data in re
 - Removed unused `Config` parameter from `parseClassificationResponse`
 - Added `parentCollection` support to `ZoteroCollection` type and decoder (handles Zotero's quirky `false` vs string response)
 - Added `encodeCreateSubCollection` and batch write encoders for multi-object API
-- 144 tests passing, zero elm-review errors
+- Fixed legacy migration hardcoding `isRefusal = False` instead of checking the migrated content
+- 145 tests passing, zero elm-review errors
 
 ## v0.1.1 — The Paperwork Release
 

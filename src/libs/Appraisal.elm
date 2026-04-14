@@ -341,13 +341,20 @@ migrateFromLegacy { tags, reasoningNoteHtml } =
                     Nothing ->
                         ( "", "" )
 
+            classificationResult =
+                { relevance = starTag |> Maybe.withDefault Classification.ThreeStars
+                , reasoning = reasoning
+                , note = note
+                , deathAfterTherapy = deathAfterTherapy
+                }
+
             appraisal =
                 { relevance = relevanceInt
                 , decision = decision
                 , reasoning = reasoning
                 , note = note
                 , deathAfterTherapy = deathAfterTherapy
-                , isRefusal = False
+                , isRefusal = Classification.isRefusal classificationResult
                 , model = "opus-4-6"
                 , timestamp = "31 March 2026"
                 }
