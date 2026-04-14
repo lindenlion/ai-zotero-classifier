@@ -5,12 +5,14 @@ Automated classification of PubMed articles for IEI (Inborn Errors of Immunity) 
 ## Project Structure
 
 ```
-src/ClassifyArticles.elm          Main script
+src/ClassifyArticles.elm          Main script (CLI, API orchestration, migration)
 src/libs/
-  Classification.elm              Relevance types, decision logic, system prompt, JSON decoders
+  Appraisal.elm                   Structured appraisal schema, encode/decode, note generation
+  Classification.elm              Relevance types, decision logic, JSON decoders
   ZoteroApi.elm                   Zotero item/collection types, JSON codecs, article extraction
   AnthropicApi.elm                Anthropic Messages API types, request encoder, response decoder
   Stats.elm                       Batch statistics and circuit breaker logic
+prompt.txt                        System prompt for article classification (loaded at runtime)
 tests/                            Tests (elm-test-rs)
 review/                           elm-review config (NoUnused, NoDebug, Simplify rules)
 build/                            Bundled production scripts
@@ -44,6 +46,8 @@ Fill in `.env` (loaded automatically by devbox shell):
 npm run classify                    # run classifier (prompted for batch size)
 npm run classify -- --max 50        # process 50 articles
 npm run classify:all                # process all unprocessed articles
+npm run classify -- --migrate       # migrate all legacy articles (no AI calls)
+npm run classify -- --migrate 0     # migrate from version 0 (legacy)
 npm run test                        # run all tests (elm-test-rs)
 npm run review                      # run elm-review
 npm run review:fix                  # auto-fix elm-review errors
