@@ -200,4 +200,3 @@ userPrompt article =
         ++ article.abstract
         ++ "\n\nKEYWORDS: "
         ++ article.keywords
-

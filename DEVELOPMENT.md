@@ -11,7 +11,9 @@ src/libs/
   Classification.elm              Relevance types, decision logic, JSON decoders
   ZoteroApi.elm                   Zotero item/collection types, JSON codecs, article extraction
   AnthropicApi.elm                Anthropic Messages API types, request encoder, response decoder
+  OpenAiApi.elm                   OpenAI-compatible chat API encoder/decoder (DeepSeek, etc.)
   Stats.elm                       Batch statistics and circuit breaker logic
+config.json                       Model configuration: which AI models to use (from template)
 prompt.txt                        System prompt for article classification (loaded at runtime)
 tests/                            Tests (elm-test-rs)
 review/                           elm-review config (NoUnused, NoDebug, Simplify rules)
@@ -32,13 +34,22 @@ npm install   # only needed once
 
 ```bash
 cp .env_template .env
+cp config.json.template config.json
 ```
 
-Fill in `.env` (loaded automatically by devbox shell):
-- `ZOTERO_LIBRARY_ID` — your library/group id from https://www.zotero.org/mylibrary
+Fill in `.env` with API keys (loaded automatically by devbox shell, or save as `secrets.txt`):
 - `ZOTERO_API_KEY` — create at https://www.zotero.org/settings/keys/new (read/write + notes access)
 - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/settings/keys
-- `ANTHROPIC_MODEL` — e.g. `claude-sonnet-4-6`
+- `DEEPSEEK_API_KEY` — from https://platform.deepseek.com/api_keys
+
+Fill in `config.json` with model configuration:
+- `zoteroLibraryId` — your library/group id from https://www.zotero.org/mylibrary
+- `models` — array of AI models to use for screening. Each model needs:
+  - `key` — identifier used in appraisals and as processed tag (e.g. "claude", "deepseek")
+  - `apiFormat` — `"anthropic"` or `"openai"` (OpenAI-compatible, e.g. DeepSeek)
+  - `model` — exact model name sent in API calls (e.g. "claude-opus-4-6", "deepseek-reasoner")
+  - `apiKeyEnvVar` — name of the env var holding the API key (e.g. "ANTHROPIC_API_KEY")
+  - `baseUrl` — API base URL (e.g. "https://api.anthropic.com", "https://api.deepseek.com")
 
 ## Commands
 

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.3.0 — The Model Parliament
+
+The one where we stopped assuming Claude is the only game in town and let multiple AI models screen articles side by side. Democracy in action, or at least a vigorous peer review.
+
+### Multi-Model Screening
+- New `config.json` config file defines AI models, each with a key, API format, model name, base URL, and API key env var name
+- Supported API formats: `anthropic` (Claude) and `openai` (OpenAI-compatible — DeepSeek, etc.)
+- Multiple models run in parallel per article using `BackendTask.andMap` — no waiting in line
+- Each model stores its appraisal under its own key in the `callNumber` JSON (e.g. `"claude"`, `"deepseek"`)
+- Per-model processed tags (e.g. `CLAUDE`, `DEEPSEEK`) — articles only screened by models that haven't seen them yet
+- Per-model Zotero collections for include/exclude sorting (e.g. "Claude included", "Deepseek included")
+- First model's decision drives star tags and primary collection placement
+
+### New Module: OpenAiApi.elm
+- Encoder/decoder for OpenAI-compatible chat completions API
+- Handles system/user message format, finish_reason parsing, and token usage
+- Used for DeepSeek and any future OpenAI-compatible providers
+
+### Configuration Overhaul
+- `config.json` replaces `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` env vars for model config
+- Zotero library ID now lives in `config.json` (not a secret, just user-specific)
+- All model fields are required (no optional fields): `key`, `apiFormat`, `model`, `apiKeyEnvVar`, `baseUrl`
+- API keys still resolved from env vars (names configured per model in `config.json`)
+- `ZOTERO_API_KEY` still from `.env` / `secrets.txt` as before
+- Fallback key file renamed from `config.txt` to `secrets.txt` — because that's what it contains
+- Template provided: `config.json.template`
+
+### Fetch Logic
+- Fetches articles per-model (missing that model's tag), merges and deduplicates
+- Per-article, only runs models whose processed tag is absent — efficient incremental screening
+- Reprocess mode still works: runs all configured models regardless of existing tags
+
+### Housekeeping
+- Partial success handling: if one model fails but another succeeds, the item is still updated
+- Classification logging now shows per-model results with `[model]` prefixes
+- 145 tests passing, zero elm-review errors
+
 ## v0.2.0 — The Great Migration
 
 The one where we stopped trusting HTML notes and started putting real data in real fields.

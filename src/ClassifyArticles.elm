@@ -16,6 +16,7 @@ import FatalError exposing (FatalError)
 import Iso8601
 import Json.Decode as Decode
 import Json.Encode as Encode
+import OpenAiApi
 import Pages.Script as Script exposing (Script)
 import Stats exposing (CircuitBreakerAction(..), Stats, emptyStats)
 import Time
@@ -29,10 +30,28 @@ import ZoteroApi
 type alias Config =
     { zoteroLibraryId : String
     , zoteroApiKey : String
-    , anthropicApiKey : String
-    , anthropicModel : String
     , systemPrompt : String
+    , models : List ModelConfig
     }
+
+
+type alias ModelConfig =
+    { key : String
+    , apiFormat : ApiFormat
+    , model : String
+    , apiKey : String
+    , baseUrl : String
+    }
+
+
+type ApiFormat
+    = Anthropic
+    | OpenAi
+
+
+configJsonFile : String
+configJsonFile =
+    "config.json"
 
 
 promptFile : String
@@ -40,28 +59,13 @@ promptFile =
     "prompt.txt"
 
 
-configFile : String
-configFile =
-    "config.txt"
+secretsFile : String
+secretsFile =
+    "secrets.txt"
 
 
 
 -- Constants
-
-
-relevantCollection : String
-relevantCollection =
-    "Claude included"
-
-
-irrelevantCollection : String
-irrelevantCollection =
-    "Claude excluded"
-
-
-processedTag : String
-processedTag =
-    "CLAUDE"
 
 
 migrationParentCollection : String
@@ -77,6 +81,35 @@ versionCollectionPrefix =
 versionCollectionName : Int -> String
 versionCollectionName n =
     versionCollectionPrefix ++ String.fromInt n
+
+
+{-| Derive the processed tag from a model key (e.g. "claude" -> "CLAUDE").
+-}
+modelProcessedTag : ModelConfig -> String
+modelProcessedTag m =
+    String.toUpper m.key
+
+
+{-| Collection names for a model (e.g. "Claude included", "Claude excluded").
+-}
+modelRelevantCollection : ModelConfig -> String
+modelRelevantCollection m =
+    capitalize m.key ++ " included"
+
+
+modelIrrelevantCollection : ModelConfig -> String
+modelIrrelevantCollection m =
+    capitalize m.key ++ " excluded"
+
+
+capitalize : String -> String
+capitalize s =
+    case String.uncons s of
+        Just ( first, rest ) ->
+            String.fromChar (Char.toUpper first) ++ rest
+
+        Nothing ->
+            s
 
 
 
@@ -138,27 +171,36 @@ logBanner options =
                             "Mode: REPROCESS articles tagged \"" ++ tag ++ "\" (tag will be stripped)"
 
                         Nothing ->
-                            "Mode: process new articles (no CLAUDE tag)"
+                            "Mode: process new articles"
     in
     Script.log ("🔬 PubMed Article Classifier for IEI Research\n" ++ String.repeat 60 "=" ++ "\n" ++ modeMsg)
 
 
 initAndProcess : Config -> CliOptions -> BackendTask FatalError ()
 initAndProcess config options =
-    Script.log ("✓ Loaded configuration for library: " ++ config.zoteroLibraryId)
+    let
+        modelSummary =
+            config.models
+                |> List.map (\m -> m.key ++ " (" ++ m.model ++ ")")
+                |> String.join ", "
+    in
+    Script.log ("✓ Loaded configuration for library: " ++ config.zoteroLibraryId ++ "\n✓ Models: " ++ modelSummary)
         |> BackendTask.andThen (\_ -> resolveAllCollections config)
         |> BackendTask.andThen
             (\collections ->
+                let
+                    collectionSummary =
+                        collections.modelCollections
+                            |> List.map
+                                (\mc ->
+                                    "  " ++ mc.modelKey ++ ": included=" ++ mc.relevantKey ++ " excluded=" ++ mc.irrelevantKey
+                                )
+                            |> String.join "\n"
+                in
                 Script.log
-                    ("✓ Relevant collection: "
-                        ++ relevantCollection
-                        ++ " ("
-                        ++ collections.relevantKey
-                        ++ ")\n✓ Irrelevant collection: "
-                        ++ irrelevantCollection
-                        ++ " ("
-                        ++ collections.irrelevantKey
-                        ++ ")\n✓ Current schema version: "
+                    ("✓ Model collections:\n"
+                        ++ collectionSummary
+                        ++ "\n✓ Current schema version: "
                         ++ String.fromInt Appraisal.currentSchemaVersion
                         ++ " (collection: "
                         ++ collections.currentVersionKey
@@ -244,90 +286,184 @@ promptForMaxArticles =
 
 loadConfig : BackendTask FatalError Config
 loadConfig =
-    loadConfigFile
+    loadConfigJson
         |> BackendTask.andThen
-            (\fileVars ->
-                let
-                    resolveVar name =
-                        Env.get name
-                            |> BackendTask.map
-                                (\envVal ->
-                                    case envVal of
-                                        Just v ->
-                                            Ok v
-
-                                        Nothing ->
-                                            case Dict.get name fileVars of
-                                                Just v ->
-                                                    Ok v
-
-                                                Nothing ->
-                                                    Err name
-                                )
-                in
-                BackendTask.map4
-                    (\a b c d -> { libId = a, apiKey = b, anthropicKey = c, model = d })
-                    (resolveVar "ZOTERO_LIBRARY_ID")
-                    (resolveVar "ZOTERO_API_KEY")
-                    (resolveVar "ANTHROPIC_API_KEY")
-                    (resolveVar "ANTHROPIC_MODEL")
-            )
-        |> BackendTask.andThen
-            (\resolved ->
-                let
-                    missing =
-                        [ resolved.libId, resolved.apiKey, resolved.anthropicKey, resolved.model ]
-                            |> List.filterMap
-                                (\r ->
-                                    case r of
-                                        Err name ->
-                                            Just name
-
-                                        Ok _ ->
-                                            Nothing
-                                )
-                in
-                if List.isEmpty missing then
-                    case ( resolved.libId, resolved.apiKey ) of
-                        ( Ok a, Ok b ) ->
-                            case ( resolved.anthropicKey, resolved.model ) of
-                                ( Ok c, Ok d ) ->
-                                    BackendTask.succeed { zoteroLibraryId = a, zoteroApiKey = b, anthropicApiKey = c, anthropicModel = d, systemPrompt = "" }
-
-                                _ ->
-                                    BackendTask.fail (FatalError.fromString "Unexpected config error")
-
-                        _ ->
-                            BackendTask.fail (FatalError.fromString "Unexpected config error")
-
-                else
-                    BackendTask.fail
-                        (FatalError.fromString
-                            ("Missing configuration: "
-                                ++ String.join ", " missing
-                                ++ "\nSet them in your shell environment or in "
-                                ++ configFile
-                            )
+            (\cfg ->
+                resolveZoteroApiKey
+                    |> BackendTask.andThen
+                        (\zoteroApiKey ->
+                            resolveModelApiKeys cfg.models
+                                |> BackendTask.andThen
+                                    (\resolvedModels ->
+                                        loadPromptFile
+                                            |> BackendTask.map
+                                                (\prompt ->
+                                                    { zoteroLibraryId = cfg.zoteroLibraryId
+                                                    , zoteroApiKey = zoteroApiKey
+                                                    , systemPrompt = prompt
+                                                    , models = resolvedModels
+                                                    }
+                                                )
+                                    )
                         )
             )
+
+
+{-| Raw config.json structure before API key resolution.
+-}
+type alias ConfigJson =
+    { zoteroLibraryId : String
+    , models : List ConfigModelJson
+    }
+
+
+type alias ConfigModelJson =
+    { key : String
+    , apiFormat : String
+    , model : String
+    , apiKeyEnvVar : String
+    , baseUrl : String
+    }
+
+
+loadConfigJson : BackendTask FatalError ConfigJson
+loadConfigJson =
+    BackendTask.File.rawFile configJsonFile
+        |> BackendTask.allowFatal
         |> BackendTask.andThen
-            (\partialConfig ->
-                loadPromptFile
-                    |> BackendTask.map (\prompt -> { partialConfig | systemPrompt = prompt })
+            (\content ->
+                case Decode.decodeString configJsonDecoder content of
+                    Ok cfg ->
+                        if List.isEmpty cfg.models then
+                            BackendTask.fail (FatalError.fromString "config.json must define at least one model.")
+
+                        else
+                            BackendTask.succeed cfg
+
+                    Err err ->
+                        BackendTask.fail
+                            (FatalError.fromString
+                                ("Failed to parse " ++ configJsonFile ++ ": " ++ Decode.errorToString err)
+                            )
+            )
+        |> BackendTask.onError
+            (\_ ->
+                BackendTask.fail
+                    (FatalError.fromString
+                        ("Missing " ++ configJsonFile ++ ". Copy config.json.template to config.json and fill in your values.")
+                    )
             )
 
 
-{-| Parse config.txt as KEY=VALUE lines (ignoring comments and blank lines).
+configJsonDecoder : Decode.Decoder ConfigJson
+configJsonDecoder =
+    Decode.map2 ConfigJson
+        (Decode.field "zoteroLibraryId" Decode.string)
+        (Decode.field "models" (Decode.list configModelJsonDecoder))
+
+
+configModelJsonDecoder : Decode.Decoder ConfigModelJson
+configModelJsonDecoder =
+    Decode.map5 ConfigModelJson
+        (Decode.field "key" Decode.string)
+        (Decode.field "apiFormat" Decode.string)
+        (Decode.field "model" Decode.string)
+        (Decode.field "apiKeyEnvVar" Decode.string)
+        (Decode.field "baseUrl" Decode.string)
+
+
+{-| Resolve ZOTERO\_API\_KEY from env or secrets.txt fallback.
 -}
-loadConfigFile : BackendTask FatalError (Dict String String)
-loadConfigFile =
-    BackendTask.File.rawFile configFile
-        |> BackendTask.map parseConfigFile
+resolveZoteroApiKey : BackendTask FatalError String
+resolveZoteroApiKey =
+    loadSecretsFile
+        |> BackendTask.andThen
+            (\fileVars ->
+                resolveEnvVar "ZOTERO_API_KEY" fileVars
+            )
+
+
+{-| Resolve a single env var with secrets.txt fallback.
+-}
+resolveEnvVar : String -> Dict String String -> BackendTask FatalError String
+resolveEnvVar name fileVars =
+    Env.get name
+        |> BackendTask.andThen
+            (\envVal ->
+                case envVal of
+                    Just v ->
+                        BackendTask.succeed v
+
+                    Nothing ->
+                        case Dict.get name fileVars of
+                            Just v ->
+                                BackendTask.succeed v
+
+                            Nothing ->
+                                BackendTask.fail
+                                    (FatalError.fromString
+                                        ("Missing environment variable: "
+                                            ++ name
+                                            ++ "\nSet it in your shell environment or in "
+                                            ++ secretsFile
+                                        )
+                                    )
+            )
+
+
+{-| Resolve API keys for all configured models from env vars.
+-}
+resolveModelApiKeys : List ConfigModelJson -> BackendTask FatalError (List ModelConfig)
+resolveModelApiKeys models =
+    loadSecretsFile
+        |> BackendTask.andThen
+            (\fileVars ->
+                resolveModelApiKeysHelper models fileVars []
+            )
+
+
+resolveModelApiKeysHelper : List ConfigModelJson -> Dict String String -> List ModelConfig -> BackendTask FatalError (List ModelConfig)
+resolveModelApiKeysHelper models fileVars acc =
+    case models of
+        [] ->
+            BackendTask.succeed (List.reverse acc)
+
+        m :: rest ->
+            resolveEnvVar m.apiKeyEnvVar fileVars
+                |> BackendTask.andThen
+                    (\apiKey ->
+                        let
+                            apiFormat =
+                                case m.apiFormat of
+                                    "anthropic" ->
+                                        Anthropic
+
+                                    _ ->
+                                        OpenAi
+
+                            modelConfig =
+                                { key = m.key
+                                , apiFormat = apiFormat
+                                , model = m.model
+                                , apiKey = apiKey
+                                , baseUrl = m.baseUrl
+                                }
+                        in
+                        resolveModelApiKeysHelper rest fileVars (modelConfig :: acc)
+                    )
+
+
+{-| Parse secrets.txt as KEY=VALUE lines (ignoring comments and blank lines).
+-}
+loadSecretsFile : BackendTask FatalError (Dict String String)
+loadSecretsFile =
+    BackendTask.File.rawFile secretsFile
+        |> BackendTask.map parseSecretsFile
         |> BackendTask.onError (\_ -> BackendTask.succeed Dict.empty)
 
 
-parseConfigFile : String -> Dict String String
-parseConfigFile content =
+parseSecretsFile : String -> Dict String String
+parseSecretsFile content =
     content
         |> String.lines
         |> List.filterMap
@@ -366,12 +502,27 @@ loadPromptFile =
 -- Zotero API helpers
 
 
-type alias Collections =
-    { relevantKey : String
+type alias ModelCollectionKeys =
+    { modelKey : String
+    , relevantKey : String
     , irrelevantKey : String
+    }
+
+
+type alias Collections =
+    { modelCollections : List ModelCollectionKeys
     , currentVersionKey : String
     , versionKeys : Dict Int String
     }
+
+
+{-| Look up the collection keys for a specific model.
+-}
+collectionsForModel : String -> Collections -> Maybe ModelCollectionKeys
+collectionsForModel modelKey collections =
+    collections.modelCollections
+        |> List.filter (\mc -> mc.modelKey == modelKey)
+        |> List.head
 
 
 zoteroBaseUrl : String -> String
@@ -453,22 +604,50 @@ resolveAllCollections config =
             )
         |> BackendTask.andThen
             (\allCollections ->
-                BackendTask.map2 Tuple.pair
-                    (ensureCollection config relevantCollection allCollections)
-                    (ensureCollection config irrelevantCollection allCollections)
+                resolveModelCollections config allCollections
                     |> BackendTask.andThen
-                        (\( relKey, irrelKey ) ->
+                        (\modelColls ->
                             resolveVersionCollections config allCollections
                                 |> BackendTask.map
                                     (\( currentKey, vKeys ) ->
-                                        { relevantKey = relKey
-                                        , irrelevantKey = irrelKey
+                                        { modelCollections = modelColls
                                         , currentVersionKey = currentKey
                                         , versionKeys = vKeys
                                         }
                                     )
                         )
             )
+
+
+{-| Resolve included/excluded collections for each configured model.
+-}
+resolveModelCollections : Config -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError (List ModelCollectionKeys)
+resolveModelCollections config allCollections =
+    resolveModelCollectionsHelper config.models config allCollections []
+
+
+resolveModelCollectionsHelper : List ModelConfig -> Config -> List ZoteroApi.ZoteroCollection -> List ModelCollectionKeys -> BackendTask FatalError (List ModelCollectionKeys)
+resolveModelCollectionsHelper models config allCollections acc =
+    case models of
+        [] ->
+            BackendTask.succeed (List.reverse acc)
+
+        m :: rest ->
+            BackendTask.map2 Tuple.pair
+                (ensureCollection config (modelRelevantCollection m) allCollections)
+                (ensureCollection config (modelIrrelevantCollection m) allCollections)
+                |> BackendTask.andThen
+                    (\( relKey, irrelKey ) ->
+                        resolveModelCollectionsHelper rest
+                            config
+                            allCollections
+                            ({ modelKey = m.key
+                             , relevantKey = relKey
+                             , irrelevantKey = irrelKey
+                             }
+                                :: acc
+                            )
+                    )
 
 
 resolveVersionCollections : Config -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError ( String, Dict Int String )
@@ -582,15 +761,18 @@ createSubCollection config name parentKey =
             )
 
 
-{-| Fetch articles to process.
+{-| Fetch articles to process for a given model.
 
-  - Normal mode (reprocessTag = Nothing): articles WITHOUT the CLAUDE tag.
-  - Reprocess mode (reprocessTag = Just tag): articles WITH both CLAUDE and the given tag.
+  - Normal mode (reprocessTag = Nothing): articles WITHOUT the model's processed tag.
+  - Reprocess mode (reprocessTag = Just tag): articles WITH both the model's tag and the given tag.
 
 -}
-fetchItems : Config -> Maybe String -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
-fetchItems config reprocessTag limit =
+fetchItemsForModel : Config -> ModelConfig -> Maybe String -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
+fetchItemsForModel config modelConfig reprocessTag limit =
     let
+        processedTag =
+            modelProcessedTag modelConfig
+
         tagFilter =
             case reprocessTag of
                 Nothing ->
@@ -607,7 +789,7 @@ fetchItems config reprocessTag limit =
                 ++ String.fromInt limit
                 ++ "&itemType=-note"
     in
-    Script.log ("GET /items?" ++ tagFilter)
+    Script.log ("GET /items?" ++ tagFilter ++ " (for " ++ modelConfig.key ++ ")")
         |> BackendTask.andThen
             (\_ ->
                 BackendTask.Http.request
@@ -621,6 +803,40 @@ fetchItems config reprocessTag limit =
                     (BackendTask.Http.expectJson ZoteroApi.itemListDecoder)
                     |> BackendTask.allowFatal
             )
+
+
+{-| Fetch articles needing screening. Fetches per-model and merges (dedup by item key).
+-}
+fetchItems : Config -> Maybe String -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
+fetchItems config reprocessTag limit =
+    fetchItemsForModels config config.models reprocessTag limit Dict.empty
+        |> BackendTask.map Dict.values
+
+
+fetchItemsForModels : Config -> List ModelConfig -> Maybe String -> Int -> Dict String ZoteroApi.ZoteroItem -> BackendTask FatalError (Dict String ZoteroApi.ZoteroItem)
+fetchItemsForModels config models reprocessTag limit acc =
+    case models of
+        [] ->
+            BackendTask.succeed acc
+
+        m :: rest ->
+            let
+                remaining =
+                    limit - Dict.size acc
+            in
+            if remaining <= 0 then
+                BackendTask.succeed acc
+
+            else
+                fetchItemsForModel config m reprocessTag remaining
+                    |> BackendTask.andThen
+                        (\items ->
+                            let
+                                merged =
+                                    List.foldl (\item d -> Dict.insert item.key item d) acc items
+                            in
+                            fetchItemsForModels config rest reprocessTag limit merged
+                        )
 
 
 {-| PATCH an item's tags and collections in a single request.
@@ -687,12 +903,13 @@ patchNote config note newContent =
 
 
 
+-- AI API calls
 
--- Anthropic API
 
-
-classifyArticle : Config -> ZoteroApi.ArticleData -> BackendTask FatalError (Result String Classification.ClassificationResult)
-classifyArticle config article =
+{-| Classify an article with a specific model, dispatching to the right API format.
+-}
+classifyArticle : ModelConfig -> String -> ZoteroApi.ArticleData -> BackendTask FatalError (Result String Classification.ClassificationResult)
+classifyArticle modelConfig systemPrompt article =
     let
         userMessage =
             Classification.userPrompt
@@ -700,20 +917,31 @@ classifyArticle config article =
                 , abstract = article.abstract
                 , keywords = article.keywords
                 }
+    in
+    case modelConfig.apiFormat of
+        Anthropic ->
+            classifyWithAnthropic modelConfig systemPrompt userMessage
 
+        OpenAi ->
+            classifyWithOpenAi modelConfig systemPrompt userMessage
+
+
+classifyWithAnthropic : ModelConfig -> String -> String -> BackendTask FatalError (Result String Classification.ClassificationResult)
+classifyWithAnthropic modelConfig systemPrompt userMessage =
+    let
         requestBody =
             AnthropicApi.encodeMessageRequest
-                { model = config.anthropicModel
+                { model = modelConfig.model
                 , maxTokens = 1000
-                , systemPrompt = config.systemPrompt
+                , systemPrompt = systemPrompt
                 , userMessage = userMessage
                 }
     in
-    loggedRequest "Anthropic API"
-        { url = "https://api.anthropic.com/v1/messages"
+    loggedRequest ("Anthropic API (" ++ modelConfig.key ++ ")")
+        { url = modelConfig.baseUrl ++ "/v1/messages"
         , method = "POST"
         , headers =
-            [ ( "x-api-key", config.anthropicApiKey )
+            [ ( "x-api-key", modelConfig.apiKey )
             , ( "anthropic-version", "2023-06-01" )
             , ( "Content-Type", "application/json" )
             ]
@@ -722,11 +950,37 @@ classifyArticle config article =
         , timeoutInMs = Just 120000
         }
         (BackendTask.Http.expectJson AnthropicApi.messageResponseDecoder)
-        |> BackendTask.map (Result.andThen parseClassificationResponse)
+        |> BackendTask.map (Result.andThen parseAnthropicResponse)
 
 
-parseClassificationResponse : AnthropicApi.MessageResponse -> Result String Classification.ClassificationResult
-parseClassificationResponse response =
+classifyWithOpenAi : ModelConfig -> String -> String -> BackendTask FatalError (Result String Classification.ClassificationResult)
+classifyWithOpenAi modelConfig systemPrompt userMessage =
+    let
+        requestBody =
+            OpenAiApi.encodeChatRequest
+                { model = modelConfig.model
+                , maxTokens = 1000
+                , systemPrompt = systemPrompt
+                , userMessage = userMessage
+                }
+    in
+    loggedRequest ("OpenAI-compatible API (" ++ modelConfig.key ++ ")")
+        { url = modelConfig.baseUrl ++ "/chat/completions"
+        , method = "POST"
+        , headers =
+            [ ( "Authorization", "Bearer " ++ modelConfig.apiKey )
+            , ( "Content-Type", "application/json" )
+            ]
+        , body = BackendTask.Http.jsonBody requestBody
+        , retries = Nothing
+        , timeoutInMs = Just 120000
+        }
+        (BackendTask.Http.expectJson OpenAiApi.chatResponseDecoder)
+        |> BackendTask.map (Result.andThen parseOpenAiResponse)
+
+
+parseAnthropicResponse : AnthropicApi.MessageResponse -> Result String Classification.ClassificationResult
+parseAnthropicResponse response =
     case response.stopReason of
         AnthropicApi.Refusal ->
             Ok Classification.refusalResult
@@ -747,8 +1001,73 @@ parseClassificationResponse response =
                     Err ("JSON decode error: " ++ Decode.errorToString err ++ " | Raw: " ++ textContent)
 
 
+parseOpenAiResponse : OpenAiApi.ChatResponse -> Result String Classification.ClassificationResult
+parseOpenAiResponse response =
+    case response.finishReason of
+        OpenAiApi.ContentFilter ->
+            Ok Classification.refusalResult
+
+        _ ->
+            let
+                textContent =
+                    OpenAiApi.extractText response
+
+                cleanedJson =
+                    textContent |> String.trim |> AnthropicApi.stripJsonFences
+            in
+            case Decode.decodeString Classification.classificationResultDecoder cleanedJson of
+                Ok result ->
+                    Ok result
+
+                Err err ->
+                    Err ("JSON decode error: " ++ Decode.errorToString err ++ " | Raw: " ++ textContent)
+
+
+{-| Classify an article with all configured models in parallel using BackendTask.andMap.
+Returns a list of (modelKey, Result) pairs.
+-}
+classifyWithAllModels :
+    Config
+    -> ZoteroApi.ArticleData
+    -> List ModelConfig
+    -> BackendTask FatalError (List ( String, Result String Classification.ClassificationResult ))
+classifyWithAllModels config article models =
+    let
+        classifyOne m =
+            classifyArticle m config.systemPrompt article
+                |> BackendTask.map (\result -> ( m.key, result ))
+    in
+    combineBackendTasks (List.map classifyOne models)
+
+
+{-| Combine a list of BackendTasks into a BackendTask of a list, running in parallel.
+Uses BackendTask.andMap for parallel execution.
+-}
+combineBackendTasks : List (BackendTask FatalError a) -> BackendTask FatalError (List a)
+combineBackendTasks tasks =
+    List.foldl
+        (\task acc ->
+            BackendTask.succeed (\list item -> list ++ [ item ])
+                |> BackendTask.andMap acc
+                |> BackendTask.andMap task
+        )
+        (BackendTask.succeed [])
+        tasks
+
+
 
 -- Item update
+
+
+{-| Determine which models still need to screen this item (tag not yet present).
+-}
+modelsNeedingScreening : List ModelConfig -> ZoteroApi.ZoteroItem -> List ModelConfig
+modelsNeedingScreening models item =
+    let
+        existingTags =
+            List.map .tag item.data.tags
+    in
+    List.filter (\m -> not (List.member (modelProcessedTag m) existingTags)) models
 
 
 isReprocessTag : Maybe String -> String -> Bool
@@ -761,10 +1080,10 @@ isReprocessTag reprocessTag tagName =
             False
 
 
-{-| Update a Zotero item after classification.
+{-| Update a Zotero item after classification by one or more models.
 
 1.  Build AppraisalData from existing callNumber (or migrate legacy data).
-2.  Insert the new Claude appraisal.
+2.  Insert all new model appraisals.
 3.  PATCH item: tags, collections, and callNumber (structured JSON).
 4.  GET child notes, then create/overwrite the reasoning note.
 
@@ -774,9 +1093,9 @@ updateItem :
     -> Collections
     -> Maybe String
     -> ZoteroApi.ZoteroItem
-    -> Classification.ClassificationResult
+    -> List ( String, Classification.ClassificationResult )
     -> BackendTask FatalError (Result String ())
-updateItem config collections reprocessTag item result =
+updateItem config collections reprocessTag item modelResults =
     BackendTask.Time.now
         |> BackendTask.andThen
             (\now ->
@@ -784,33 +1103,78 @@ updateItem config collections reprocessTag item result =
                     timestamp =
                         Iso8601.fromTime now
 
-                    appraisal =
-                        Appraisal.fromClassificationResult
-                            { model = config.anthropicModel, timestamp = timestamp }
-                            result
+                    -- Find the model config for each result to get model name
+                    modelConfigFor key =
+                        config.models
+                            |> List.filter (\m -> m.key == key)
+                            |> List.head
+                            |> Maybe.map .model
+                            |> Maybe.withDefault key
 
                     baseAppraisalData =
                         resolveAppraisalData item
 
+                    -- Insert all model appraisals
                     appraisalData =
-                        Appraisal.setAppraisal "claude" appraisal baseAppraisalData
+                        List.foldl
+                            (\( key, result ) acc ->
+                                let
+                                    appraisal =
+                                        Appraisal.fromClassificationResult
+                                            { model = modelConfigFor key, timestamp = timestamp }
+                                            result
+                                in
+                                Appraisal.setAppraisal key appraisal acc
+                            )
+                            baseAppraisalData
+                            modelResults
 
                     callNumberJson =
                         Appraisal.encode appraisalData
                             |> Encode.encode 0
 
-                    decision =
-                        Classification.relevanceToDecision result.relevance
+                    -- Use the first model's result for collection placement and star tags
+                    primaryResult =
+                        List.head modelResults
 
+                    primaryDecision =
+                        primaryResult
+                            |> Maybe.map (\( _, r ) -> Classification.relevanceToDecision r.relevance)
+                            |> Maybe.withDefault Classification.Include
+
+                    primaryRelevance =
+                        primaryResult
+                            |> Maybe.map (\( _, r ) -> r.relevance)
+                            |> Maybe.withDefault Classification.ThreeStars
+
+                    primaryDeathAfterTherapy =
+                        primaryResult
+                            |> Maybe.map (\( _, r ) -> r.deathAfterTherapy)
+                            |> Maybe.withDefault False
+
+                    primaryModelKey =
+                        primaryResult
+                            |> Maybe.map Tuple.first
+                            |> Maybe.withDefault ""
+
+                    -- Target collection from the primary model
                     targetCollectionKey =
-                        case decision of
-                            Classification.Include ->
-                                collections.relevantKey
+                        case collectionsForModel primaryModelKey collections of
+                            Just mc ->
+                                case primaryDecision of
+                                    Classification.Include ->
+                                        mc.relevantKey
 
-                            Classification.Exclude ->
-                                collections.irrelevantKey
+                                    Classification.Exclude ->
+                                        mc.irrelevantKey
 
-                    -- Strip old star tags, death_after_therapy, CLAUDE, and the reprocess tag
+                            Nothing ->
+                                ""
+
+                    -- Strip old star tags, death_after_therapy, all model processed tags, and reprocess tag
+                    allProcessedTags =
+                        List.map modelProcessedTag config.models
+
                     cleanedTags =
                         item.data.tags
                             |> List.filter
@@ -818,17 +1182,27 @@ updateItem config collections reprocessTag item result =
                                     not (Classification.isStarTag t.tag)
                                         && t.tag
                                         /= "death_after_therapy"
-                                        && t.tag
-                                        /= processedTag
+                                        && not (List.member t.tag allProcessedTags)
                                         && not (isReprocessTag reprocessTag t.tag)
                                 )
 
+                    -- Add processed tags for each model that returned a result
+                    newModelTags =
+                        modelResults
+                            |> List.map (\( key, _ ) -> { tag = String.toUpper key })
+
+                    -- Keep existing processed tags for models not in this batch
+                    existingModelTags =
+                        item.data.tags
+                            |> List.filter (\t -> List.member t.tag allProcessedTags)
+                            |> List.filter (\t -> not (List.any (\( key, _ ) -> String.toUpper key == t.tag) modelResults))
+
                     newTags =
                         cleanedTags
-                            ++ [ { tag = processedTag }
-                               , { tag = Classification.relevanceToEmoji result.relevance }
-                               ]
-                            ++ (if result.deathAfterTherapy then
+                            ++ existingModelTags
+                            ++ newModelTags
+                            ++ [ { tag = Classification.relevanceToEmoji primaryRelevance } ]
+                            ++ (if primaryDeathAfterTherapy then
                                     [ { tag = "death_after_therapy" } ]
 
                                 else
@@ -844,8 +1218,10 @@ updateItem config collections reprocessTag item result =
                             |> List.filter (\c -> not (List.member c allVersionKeys))
 
                     newCollections =
-                        collectionsWithoutOldVersions
+                        (collectionsWithoutOldVersions
                             ++ [ targetCollectionKey, collections.currentVersionKey ]
+                        )
+                            |> List.filter (\c -> c /= "")
                             |> dedup
 
                     noteHtml =
@@ -1392,7 +1768,7 @@ processBatch config collections reprocessTag items idx total stats =
                     )
 
 
-{-| Process a single article: classify then update Zotero.
+{-| Process a single article: classify with all applicable models in parallel, then update Zotero.
 Returns updated stats and the circuit breaker action to take.
 -}
 processArticle :
@@ -1406,12 +1782,105 @@ processArticle config collections reprocessTag item stats =
     let
         article =
             ZoteroApi.articleDataFromItem item
+
+        -- Only run models that haven't screened this item yet (unless reprocessing)
+        applicableModels =
+            case reprocessTag of
+                Just _ ->
+                    config.models
+
+                Nothing ->
+                    modelsNeedingScreening config.models item
+
+        modelNames =
+            applicableModels |> List.map .key |> String.join ", "
     in
-    classifyArticle config article
-        |> BackendTask.andThen
-            (\classResult ->
-                case classResult of
-                    Ok result ->
+    if List.isEmpty applicableModels then
+        -- All models have already screened this item
+        Script.log "  → Already screened by all models, skipping"
+            |> BackendTask.map (\_ -> ( stats, Continue ))
+
+    else
+        Script.log ("  → Screening with: " ++ modelNames)
+            |> BackendTask.andThen (\_ -> classifyWithAllModels config article applicableModels)
+            |> BackendTask.andThen
+                (\results ->
+                    let
+                        successes =
+                            results
+                                |> List.filterMap
+                                    (\( key, r ) ->
+                                        case r of
+                                            Ok result ->
+                                                Just ( key, result )
+
+                                            Err _ ->
+                                                Nothing
+                                    )
+
+                        failures =
+                            results
+                                |> List.filterMap
+                                    (\( key, r ) ->
+                                        case r of
+                                            Err msg ->
+                                                Just ( key, msg )
+
+                                            Ok _ ->
+                                                Nothing
+                                    )
+                    in
+                    -- Log each result
+                    logModelResults successes failures
+                        |> BackendTask.andThen
+                            (\_ ->
+                                if List.isEmpty successes then
+                                    -- All models failed
+                                    let
+                                        errMsg =
+                                            failures |> List.map (\( k, msg ) -> k ++ ": " ++ msg) |> String.join "; "
+                                    in
+                                    handleArticleError errMsg stats
+
+                                else
+                                    -- At least one model succeeded — update the item
+                                    updateItem config collections reprocessTag item successes
+                                        |> BackendTask.andThen
+                                            (\updateResult ->
+                                                case updateResult of
+                                                    Ok _ ->
+                                                        let
+                                                            newStats =
+                                                                updateStatsFromResults stats successes
+                                                        in
+                                                        if List.isEmpty failures then
+                                                            BackendTask.succeed ( newStats, Continue )
+
+                                                        else
+                                                            -- Partial success — log failures but don't circuit-break
+                                                            let
+                                                                failMsg =
+                                                                    failures |> List.map Tuple.first |> String.join ", "
+                                                            in
+                                                            Script.log ("  ⚠ Partial: " ++ failMsg ++ " failed, but item updated with successful results")
+                                                                |> BackendTask.map (\_ -> ( newStats, Continue ))
+
+                                                    Err updateErr ->
+                                                        handleArticleError ("Update failed — " ++ updateErr) stats
+                                            )
+                            )
+                )
+
+
+{-| Log classification results for each model.
+-}
+logModelResults : List ( String, Classification.ClassificationResult ) -> List ( String, String ) -> BackendTask FatalError ()
+logModelResults successes failures =
+    let
+        successLogs =
+            successes
+                |> List.map
+                    (\( key, result ) ->
                         let
                             hsctEmoji =
                                 if result.deathAfterTherapy then
@@ -1419,41 +1888,42 @@ processArticle config collections reprocessTag item stats =
 
                                 else
                                     ""
-
-                            decision =
-                                Classification.relevanceToDecision result.relevance
                         in
-                        Script.log ("  → " ++ Classification.relevanceToEmoji result.relevance ++ hsctEmoji ++ ": " ++ result.reasoning ++ "   → TODO: " ++ result.note)
-                            |> BackendTask.andThen (\_ -> updateItem config collections reprocessTag item result)
-                            |> BackendTask.andThen
-                                (\updateResult ->
-                                    case updateResult of
-                                        Ok _ ->
-                                            let
-                                                newStats =
-                                                    { stats | processed = stats.processed + 1 }
+                        "  → [" ++ key ++ "] " ++ Classification.relevanceToEmoji result.relevance ++ hsctEmoji ++ ": " ++ result.reasoning
+                    )
 
-                                                withDecision =
-                                                    if Classification.isRefusal result then
-                                                        { newStats | refusals = newStats.refusals + 1 }
+        failLogs =
+            failures |> List.map (\( key, msg ) -> "  ✗ [" ++ key ++ "] " ++ msg)
 
-                                                    else
-                                                        case decision of
-                                                            Classification.Include ->
-                                                                { newStats | included = newStats.included + 1 }
+        allLogs =
+            successLogs ++ failLogs
+    in
+    Script.log (String.join "\n" allLogs)
 
-                                                            Classification.Exclude ->
-                                                                { newStats | excluded = newStats.excluded + 1 }
-                                            in
-                                            BackendTask.succeed ( withDecision, Continue )
 
-                                        Err updateErr ->
-                                            handleArticleError ("Update failed — " ++ updateErr) stats
-                                )
+{-| Update stats based on successful model results. Uses the first model's decision.
+-}
+updateStatsFromResults : Stats -> List ( String, Classification.ClassificationResult ) -> Stats
+updateStatsFromResults stats successes =
+    let
+        newStats =
+            { stats | processed = stats.processed + 1 }
+    in
+    case List.head successes of
+        Just ( _, result ) ->
+            if Classification.isRefusal result then
+                { newStats | refusals = newStats.refusals + 1 }
 
-                    Err errMsg ->
-                        handleArticleError errMsg stats
-            )
+            else
+                case Classification.relevanceToDecision result.relevance of
+                    Classification.Include ->
+                        { newStats | included = newStats.included + 1 }
+
+                    Classification.Exclude ->
+                        { newStats | excluded = newStats.excluded + 1 }
+
+        Nothing ->
+            newStats
 
 
 logCircuitBreaker : String -> Stats -> BackendTask FatalError ()

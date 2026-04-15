@@ -1,0 +1,19 @@
+{
+  "zoteroLibraryId": "1234567",
+  "models": [
+    {
+      "key": "claude",
+      "apiFormat": "anthropic",
+      "model": "claude-opus-4-6",
+      "apiKeyEnvVar": "ANTHROPIC_API_KEY",
+      "baseUrl": "https://api.anthropic.com"
+    },
+    {
+      "key": "deepseek",
+      "apiFormat": "openai",
+      "model": "deepseek-reasoner",
+      "apiKeyEnvVar": "DEEPSEEK_API_KEY",
+      "baseUrl": "https://api.deepseek.com"
+    }
+  ]
+}
