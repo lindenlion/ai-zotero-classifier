@@ -18,6 +18,7 @@ import Json.Decode as Decode
 import Json.Encode as Encode
 import OpenAiApi
 import Pages.Script as Script exposing (Script)
+import Set
 import Stats exposing (CircuitBreakerAction(..), Stats, emptyStats)
 import Time
 import ZoteroApi
@@ -30,6 +31,7 @@ import ZoteroApi
 type alias Config =
     { zoteroLibraryId : String
     , zoteroApiKey : String
+    , sourceCollection : String
     , systemPrompt : String
     , models : List ModelConfig
     }
@@ -41,12 +43,21 @@ type alias ModelConfig =
     , model : String
     , apiKey : String
     , baseUrl : String
+    , enabled : Bool
     }
 
 
 type ApiFormat
     = Anthropic
     | OpenAi
+
+
+{-| Runtime configuration resolved from CLI flags and config.
+-}
+type alias RunConfig =
+    { selectedModels : List ModelConfig
+    , reprocess : Bool
+    }
 
 
 configJsonFile : String
@@ -83,13 +94,6 @@ versionCollectionName n =
     versionCollectionPrefix ++ String.fromInt n
 
 
-{-| Derive the processed tag from a model key (e.g. "claude" -> "CLAUDE").
--}
-modelProcessedTag : ModelConfig -> String
-modelProcessedTag m =
-    String.toUpper m.key
-
-
 {-| Collection names for a model (e.g. "Claude included", "Claude excluded").
 -}
 modelRelevantCollection : ModelConfig -> String
@@ -117,7 +121,8 @@ capitalize s =
 
 
 type alias CliOptions =
-    { reprocessTag : Maybe String
+    { models : Maybe String
+    , reprocess : Maybe String
     , max : Maybe String
     , migrate : Maybe String
     }
@@ -129,16 +134,20 @@ program =
         |> Program.add
             (OptionsParser.build CliOptions
                 |> OptionsParser.with
-                    (Option.optionalKeywordArg "reprocess-tag"
-                        |> Option.withDescription "Tag to select articles for reprocessing (e.g. 'CLAUDE_retry'). These articles already have CLAUDE; the specified tag will be stripped."
+                    (Option.optionalKeywordArg "models"
+                        |> Option.withDescription "Comma-separated model keys to run (default: all enabled models in config.json). Can only be combined with --max."
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "reprocess"
+                        |> Option.withDescription "Comma-separated model keys to force re-run, overwriting existing appraisals. Can only be combined with --max."
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "max"
-                        |> Option.withDescription "Maximum number of articles to process. 0 = all. Skips the interactive prompt."
+                        |> Option.withDescription "Maximum number of articles to process. 0 = all. Skips the interactive prompt. Can be combined with all other options."
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "migrate"
-                        |> Option.withDescription "Migration-only mode (no AI calls). Optional integer = oldest schema version to migrate from. Omit value to migrate all CLAUDE-tagged articles."
+                        |> Option.withDescription "Migration-only mode (no AI calls). Optional integer = oldest schema version to migrate from. Can only be combined with --max. "
                     )
             )
 
@@ -151,40 +160,143 @@ run : Script
 run =
     Script.withCliOptions program
         (\options ->
-            logBanner options
-                |> BackendTask.andThen (\_ -> loadConfig)
-                |> BackendTask.andThen (\config -> initAndProcess config options)
+            loadConfig
+                |> BackendTask.andThen
+                    (\config ->
+                        resolveRunConfig config options
+                            |> BackendTask.andThen
+                                (\runConfig ->
+                                    logBanner options runConfig
+                                        |> BackendTask.andThen (\_ -> initAndProcess config runConfig options)
+                                )
+                    )
         )
 
 
-logBanner : CliOptions -> BackendTask FatalError ()
-logBanner options =
+logBanner : CliOptions -> RunConfig -> BackendTask FatalError ()
+logBanner options runConfig =
     let
+        modelNames =
+            runConfig.selectedModels
+                |> List.map (\m -> m.key ++ " (" ++ m.model ++ ")")
+                |> String.join ", "
+
         modeMsg =
             case options.migrate of
                 Just _ ->
                     "Mode: MIGRATE schema (no AI calls)"
 
                 Nothing ->
-                    case options.reprocessTag of
-                        Just tag ->
-                            "Mode: REPROCESS articles tagged \"" ++ tag ++ "\" (tag will be stripped)"
+                    if runConfig.reprocess then
+                        "Mode: REPROCESS (overwrite existing appraisals)\nModels: " ++ modelNames
 
-                        Nothing ->
-                            "Mode: process new articles"
+                    else
+                        "Mode: process new articles\nModels: " ++ modelNames
     in
     Script.log ("🔬 PubMed Article Classifier for IEI Research\n" ++ String.repeat 60 "=" ++ "\n" ++ modeMsg)
 
 
-initAndProcess : Config -> CliOptions -> BackendTask FatalError ()
-initAndProcess config options =
+{-| Validate CLI flags and resolve the run configuration.
+-}
+resolveRunConfig : Config -> CliOptions -> BackendTask FatalError RunConfig
+resolveRunConfig config options =
     let
-        modelSummary =
-            config.models
-                |> List.map (\m -> m.key ++ " (" ++ m.model ++ ")")
-                |> String.join ", "
+        allModelKeys =
+            config.models |> List.map .key |> Set.fromList
+
+        enabledModels =
+            config.models |> List.filter .enabled
     in
-    Script.log ("✓ Loaded configuration for library: " ++ config.zoteroLibraryId ++ "\n✓ Models: " ++ modelSummary)
+    -- Validate mutual exclusion
+    case ( options.models, options.reprocess, options.migrate ) of
+        ( Nothing, Nothing, Just _ ) ->
+            BackendTask.succeed { selectedModels = [], reprocess = False }
+
+        ( Just modelsRaw, Nothing, Nothing ) ->
+            let
+                keys =
+                    parseCommaList modelsRaw
+
+                unknown =
+                    keys |> List.filter (\k -> not (Set.member k allModelKeys))
+            in
+            if not (List.isEmpty unknown) then
+                BackendTask.fail
+                    (FatalError.fromString
+                        ("Unknown model key(s) in --models: "
+                            ++ String.join ", " unknown
+                            ++ "\nAvailable: "
+                            ++ String.join ", " (Set.toList allModelKeys)
+                        )
+                    )
+
+            else
+                let
+                    keySet =
+                        Set.fromList keys
+
+                    selected =
+                        config.models |> List.filter (\m -> Set.member m.key keySet)
+                in
+                if List.isEmpty selected then
+                    BackendTask.fail (FatalError.fromString "--models must specify at least one model key.")
+
+                else
+                    BackendTask.succeed { selectedModels = selected, reprocess = False }
+
+        ( Nothing, Just reprocessRaw, Nothing ) ->
+            let
+                keys =
+                    parseCommaList reprocessRaw
+
+                unknown =
+                    keys |> List.filter (\k -> not (Set.member k allModelKeys))
+            in
+            if not (List.isEmpty unknown) then
+                BackendTask.fail
+                    (FatalError.fromString
+                        ("Unknown model key(s) in --reprocess: "
+                            ++ String.join ", " unknown
+                            ++ "\nAvailable: "
+                            ++ String.join ", " (Set.toList allModelKeys)
+                        )
+                    )
+
+            else
+                let
+                    keySet =
+                        Set.fromList keys
+
+                    selected =
+                        config.models |> List.filter (\m -> Set.member m.key keySet)
+                in
+                if List.isEmpty selected then
+                    BackendTask.fail (FatalError.fromString "--reprocess must specify at least one model key.")
+
+                else
+                    BackendTask.succeed { selectedModels = selected, reprocess = True }
+
+        ( Nothing, Nothing, Nothing ) ->
+            if List.isEmpty enabledModels then
+                BackendTask.fail (FatalError.fromString "No enabled models in config.json. Set \"enabled\": true on at least one model.")
+
+            else
+                BackendTask.succeed { selectedModels = enabledModels, reprocess = False }
+
+        _ ->
+            BackendTask.fail (FatalError.fromString "Invalid combination of CLI options.")
+
+parseCommaList : String -> List String
+parseCommaList raw =
+    raw
+        |> String.split ","
+        |> List.map String.trim
+        |> List.filter (\s -> s /= "")
+
+
+initAndProcess : Config -> RunConfig -> CliOptions -> BackendTask FatalError ()
+initAndProcess config runConfig options =
+    Script.log ("✓ Loaded configuration for library: " ++ config.zoteroLibraryId)
         |> BackendTask.andThen (\_ -> resolveAllCollections config)
         |> BackendTask.andThen
             (\collections ->
@@ -198,7 +310,11 @@ initAndProcess config options =
                             |> String.join "\n"
                 in
                 Script.log
-                    ("✓ Model collections:\n"
+                    ("✓ Source collection: "
+                        ++ config.sourceCollection
+                        ++ " ("
+                        ++ collections.sourceKey
+                        ++ ")\n✓ Model collections:\n"
                         ++ collectionSummary
                         ++ "\n✓ Current schema version: "
                         ++ String.fromInt Appraisal.currentSchemaVersion
@@ -220,7 +336,7 @@ initAndProcess config options =
                                     migrateAll config collections fromVersion maxArticles
 
                                 Nothing ->
-                                    processAll config collections options.reprocessTag maxArticles
+                                    processAll config runConfig collections maxArticles
                         )
             )
 
@@ -300,6 +416,7 @@ loadConfig =
                                                 (\prompt ->
                                                     { zoteroLibraryId = cfg.zoteroLibraryId
                                                     , zoteroApiKey = zoteroApiKey
+                                                    , sourceCollection = cfg.sourceCollection
                                                     , systemPrompt = prompt
                                                     , models = resolvedModels
                                                     }
@@ -313,6 +430,7 @@ loadConfig =
 -}
 type alias ConfigJson =
     { zoteroLibraryId : String
+    , sourceCollection : String
     , models : List ConfigModelJson
     }
 
@@ -323,6 +441,7 @@ type alias ConfigModelJson =
     , model : String
     , apiKeyEnvVar : String
     , baseUrl : String
+    , enabled : Bool
     }
 
 
@@ -357,19 +476,21 @@ loadConfigJson =
 
 configJsonDecoder : Decode.Decoder ConfigJson
 configJsonDecoder =
-    Decode.map2 ConfigJson
+    Decode.map3 ConfigJson
         (Decode.field "zoteroLibraryId" Decode.string)
+        (Decode.field "sourceCollection" Decode.string)
         (Decode.field "models" (Decode.list configModelJsonDecoder))
 
 
 configModelJsonDecoder : Decode.Decoder ConfigModelJson
 configModelJsonDecoder =
-    Decode.map5 ConfigModelJson
+    Decode.map6 ConfigModelJson
         (Decode.field "key" Decode.string)
         (Decode.field "apiFormat" Decode.string)
         (Decode.field "model" Decode.string)
         (Decode.field "apiKeyEnvVar" Decode.string)
         (Decode.field "baseUrl" Decode.string)
+        (Decode.field "enabled" Decode.bool)
 
 
 {-| Resolve ZOTERO\_API\_KEY from env or secrets.txt fallback.
@@ -447,6 +568,7 @@ resolveModelApiKeysHelper models fileVars acc =
                                 , model = m.model
                                 , apiKey = apiKey
                                 , baseUrl = m.baseUrl
+                                , enabled = m.enabled
                                 }
                         in
                         resolveModelApiKeysHelper rest fileVars (modelConfig :: acc)
@@ -510,7 +632,8 @@ type alias ModelCollectionKeys =
 
 
 type alias Collections =
-    { modelCollections : List ModelCollectionKeys
+    { sourceKey : String
+    , modelCollections : List ModelCollectionKeys
     , currentVersionKey : String
     , versionKeys : Dict Int String
     }
@@ -553,15 +676,15 @@ loggedRequest :
         }
     -> BackendTask.Http.Expect a
     -> BackendTask FatalError (Result String a)
-loggedRequest label config expect =
-    Script.log (config.method ++ " " ++ label)
+loggedRequest label reqConfig expect =
+    Script.log (reqConfig.method ++ " " ++ label)
         |> BackendTask.andThen
             (\_ ->
-                BackendTask.Http.request config expect
+                BackendTask.Http.request reqConfig expect
                     |> BackendTask.map Ok
                     |> BackendTask.onError
                         (\_ ->
-                            BackendTask.succeed (Err (config.method ++ " " ++ label ++ " failed"))
+                            BackendTask.succeed (Err (reqConfig.method ++ " " ++ label ++ " failed"))
                         )
             )
 
@@ -604,28 +727,90 @@ resolveAllCollections config =
             )
         |> BackendTask.andThen
             (\allCollections ->
-                resolveModelCollections config allCollections
-                    |> BackendTask.andThen
-                        (\modelColls ->
-                            resolveVersionCollections config allCollections
-                                |> BackendTask.map
-                                    (\( currentKey, vKeys ) ->
-                                        { modelCollections = modelColls
-                                        , currentVersionKey = currentKey
-                                        , versionKeys = vKeys
-                                        }
-                                    )
-                        )
+                -- Check for duplicate collection names among collections we need
+                let
+                    neededNames =
+                        [ config.sourceCollection, migrationParentCollection ]
+                            ++ List.concatMap (\m -> [ modelRelevantCollection m, modelIrrelevantCollection m ]) config.models
+                in
+                case findDuplicateCollections neededNames allCollections of
+                    Just errorMsg ->
+                        BackendTask.fail (FatalError.fromString errorMsg)
+
+                    Nothing ->
+                        resolveSourceAndModelCollections config allCollections
+                            |> BackendTask.andThen
+                                (\( sourceKey, modelColls ) ->
+                                    resolveVersionCollections config allCollections
+                                        |> BackendTask.map
+                                            (\( currentKey, vKeys ) ->
+                                                { sourceKey = sourceKey
+                                                , modelCollections = modelColls
+                                                , currentVersionKey = currentKey
+                                                , versionKeys = vKeys
+                                                }
+                                            )
+                                )
+            )
+
+
+{-| Check if any needed collection name appears more than once in Zotero.
+Returns an error message if duplicates found, Nothing if all clear.
+-}
+findDuplicateCollections : List String -> List ZoteroApi.ZoteroCollection -> Maybe String
+findDuplicateCollections neededNames allCollections =
+    let
+        neededSet =
+            Set.fromList neededNames
+
+        duplicates =
+            allCollections
+                |> List.filter (\c -> Set.member c.name neededSet)
+                |> List.foldl
+                    (\c acc ->
+                        Dict.update c.name
+                            (\existing ->
+                                case existing of
+                                    Just count ->
+                                        Just (count + 1)
+
+                                    Nothing ->
+                                        Just 1
+                            )
+                            acc
+                    )
+                    Dict.empty
+                |> Dict.filter (\_ count -> count > 1)
+    in
+    if Dict.isEmpty duplicates then
+        Nothing
+
+    else
+        let
+            dupeList =
+                duplicates
+                    |> Dict.toList
+                    |> List.map (\( name, count ) -> "\"" ++ name ++ "\" (" ++ String.fromInt count ++ " collections)")
+                    |> String.join ", "
+        in
+        Just ("Duplicate collection names found in Zotero: " ++ dupeList ++ ". Each collection name used by this script must be unique.")
+
+
+{-| Resolve source collection and per-model collections.
+-}
+resolveSourceAndModelCollections : Config -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError ( String, List ModelCollectionKeys )
+resolveSourceAndModelCollections config allCollections =
+    ensureCollection config config.sourceCollection allCollections
+        |> BackendTask.andThen
+            (\sourceKey ->
+                resolveModelCollectionsHelper config.models config allCollections []
+                    |> BackendTask.map (\modelColls -> ( sourceKey, modelColls ))
             )
 
 
 {-| Resolve included/excluded collections for each configured model.
+Always resolves for ALL models in config, not just selected ones.
 -}
-resolveModelCollections : Config -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError (List ModelCollectionKeys)
-resolveModelCollections config allCollections =
-    resolveModelCollectionsHelper config.models config allCollections []
-
-
 resolveModelCollectionsHelper : List ModelConfig -> Config -> List ZoteroApi.ZoteroCollection -> List ModelCollectionKeys -> BackendTask FatalError (List ModelCollectionKeys)
 resolveModelCollectionsHelper models config allCollections acc =
     case models of
@@ -761,35 +946,20 @@ createSubCollection config name parentKey =
             )
 
 
-{-| Fetch articles to process for a given model.
-
-  - Normal mode (reprocessTag = Nothing): articles WITHOUT the model's processed tag.
-  - Reprocess mode (reprocessTag = Just tag): articles WITH both the model's tag and the given tag.
-
+{-| Fetch articles from the source collection.
 -}
-fetchItemsForModel : Config -> ModelConfig -> Maybe String -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
-fetchItemsForModel config modelConfig reprocessTag limit =
+fetchFromSourceCollection : Config -> Collections -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
+fetchFromSourceCollection config collections limit =
     let
-        processedTag =
-            modelProcessedTag modelConfig
-
-        tagFilter =
-            case reprocessTag of
-                Nothing ->
-                    "tag=-" ++ processedTag
-
-                Just tag ->
-                    "tag=" ++ processedTag ++ "&tag=" ++ tag
-
         url =
             zoteroBaseUrl config.zoteroLibraryId
-                ++ "/items?"
-                ++ tagFilter
-                ++ "&limit="
-                ++ String.fromInt limit
+                ++ "/collections/"
+                ++ collections.sourceKey
+                ++ "/items?limit="
+                ++ String.fromInt (min 100 limit)
                 ++ "&itemType=-note"
     in
-    Script.log ("GET /items?" ++ tagFilter ++ " (for " ++ modelConfig.key ++ ")")
+    Script.log ("GET /collections/" ++ collections.sourceKey ++ "/items (source)")
         |> BackendTask.andThen
             (\_ ->
                 BackendTask.Http.request
@@ -803,40 +973,6 @@ fetchItemsForModel config modelConfig reprocessTag limit =
                     (BackendTask.Http.expectJson ZoteroApi.itemListDecoder)
                     |> BackendTask.allowFatal
             )
-
-
-{-| Fetch articles needing screening. Fetches per-model and merges (dedup by item key).
--}
-fetchItems : Config -> Maybe String -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
-fetchItems config reprocessTag limit =
-    fetchItemsForModels config config.models reprocessTag limit Dict.empty
-        |> BackendTask.map Dict.values
-
-
-fetchItemsForModels : Config -> List ModelConfig -> Maybe String -> Int -> Dict String ZoteroApi.ZoteroItem -> BackendTask FatalError (Dict String ZoteroApi.ZoteroItem)
-fetchItemsForModels config models reprocessTag limit acc =
-    case models of
-        [] ->
-            BackendTask.succeed acc
-
-        m :: rest ->
-            let
-                remaining =
-                    limit - Dict.size acc
-            in
-            if remaining <= 0 then
-                BackendTask.succeed acc
-
-            else
-                fetchItemsForModel config m reprocessTag remaining
-                    |> BackendTask.andThen
-                        (\items ->
-                            let
-                                merged =
-                                    List.foldl (\item d -> Dict.insert item.key item d) acc items
-                            in
-                            fetchItemsForModels config rest reprocessTag limit merged
-                        )
 
 
 {-| PATCH an item's tags and collections in a single request.
@@ -1023,7 +1159,7 @@ parseOpenAiResponse response =
                     Err ("JSON decode error: " ++ Decode.errorToString err ++ " | Raw: " ++ textContent)
 
 
-{-| Classify an article with all configured models in parallel using BackendTask.andMap.
+{-| Classify an article with all applicable models in parallel using BackendTask.andMap.
 Returns a list of (modelKey, Result) pairs.
 -}
 classifyWithAllModels :
@@ -1056,33 +1192,83 @@ combineBackendTasks tasks =
 
 
 
--- Item update
+-- Article screening logic
 
 
-{-| Determine which models still need to screen this item (tag not yet present).
+{-| Determine which models need to screen this article.
+
+  - Reprocess mode: all selected models (force re-run)
+  - Normal mode: only selected models without an existing appraisal
+
 -}
-modelsNeedingScreening : List ModelConfig -> ZoteroApi.ZoteroItem -> List ModelConfig
-modelsNeedingScreening models item =
+modelsForArticle : RunConfig -> ZoteroApi.ZoteroItem -> List ModelConfig
+modelsForArticle runConfig item =
+    if runConfig.reprocess then
+        runConfig.selectedModels
+
+    else
+        let
+            existingAppraisalKeys =
+                case Decode.decodeString Appraisal.decode item.data.callNumber of
+                    Ok data ->
+                        data.appraisals |> Dict.keys |> Set.fromList
+
+                    Err _ ->
+                        Set.empty
+        in
+        runConfig.selectedModels
+            |> List.filter (\m -> not (Set.member m.key existingAppraisalKeys))
+
+
+{-| Compute the maximum star rating across existing tags and new results.
+Never downgrades — returns the highest relevance.
+-}
+maxStarRelevance : List ZoteroApi.ZoteroTag -> List Classification.ClassificationResult -> Classification.Relevance
+maxStarRelevance existingTags newResults =
     let
-        existingTags =
-            List.map .tag item.data.tags
+        existingMax =
+            existingTags
+                |> List.filterMap (\t -> Classification.emojiToRelevance t.tag)
+                |> List.map Classification.relevanceToInt
+                |> List.maximum
+                |> Maybe.withDefault 0
+
+        newMax =
+            newResults
+                |> List.map (\r -> Classification.relevanceToInt r.relevance)
+                |> List.maximum
+                |> Maybe.withDefault 0
+
+        finalInt =
+            max existingMax newMax
     in
-    List.filter (\m -> not (List.member (modelProcessedTag m) existingTags)) models
+    Classification.intToRelevance finalInt
+        |> Maybe.withDefault Classification.ThreeStars
 
 
-isReprocessTag : Maybe String -> String -> Bool
-isReprocessTag reprocessTag tagName =
-    case reprocessTag of
-        Just rt ->
-            tagName == rt
+{-| Check if death_after_therapy is flagged by ANY appraisal (existing or new).
+-}
+anyDeathAfterTherapy : Appraisal.AppraisalData -> List Classification.ClassificationResult -> Bool
+anyDeathAfterTherapy existingData newResults =
+    let
+        existingHasIt =
+            existingData.appraisals
+                |> Dict.values
+                |> List.any .deathAfterTherapy
 
-        Nothing ->
-            False
+        newHasIt =
+            newResults |> List.any .deathAfterTherapy
+    in
+    existingHasIt || newHasIt
+
+
+
+-- Item update
 
 
 {-| Update a Zotero item after classification by one or more models.
 
-1.  Build AppraisalData from existing callNumber (or migrate legacy data).
+1.  Build AppraisalData from existing callNumber (or start empty).
 2.  Insert all new model appraisals.
 3.  PATCH item: tags, collections, and callNumber (structured JSON).
 4.  GET child notes, then create/overwrite the reasoning note.
@@ -1091,11 +1277,11 @@ isReprocessTag reprocessTag tagName =
 updateItem :
     Config
     -> Collections
-    -> Maybe String
     -> ZoteroApi.ZoteroItem
     -> List ( String, Classification.ClassificationResult )
+    -> Bool
     -> BackendTask FatalError (Result String ())
-updateItem config collections reprocessTag item modelResults =
+updateItem config collections item modelResults allSucceeded =
     BackendTask.Time.now
         |> BackendTask.andThen
             (\now ->
@@ -1103,7 +1289,6 @@ updateItem config collections reprocessTag item modelResults =
                     timestamp =
                         Iso8601.fromTime now
 
-                    -- Find the model config for each result to get model name
                     modelConfigFor key =
                         config.models
                             |> List.filter (\m -> m.key == key)
@@ -1111,8 +1296,14 @@ updateItem config collections reprocessTag item modelResults =
                             |> Maybe.map .model
                             |> Maybe.withDefault key
 
+                    -- Don't attempt legacy migration — just start empty if callNumber is invalid
                     baseAppraisalData =
-                        resolveAppraisalData item
+                        case Decode.decodeString Appraisal.decode item.data.callNumber of
+                            Ok data ->
+                                Appraisal.migrateToCurrentVersion data
+
+                            Err _ ->
+                                Appraisal.empty
 
                     -- Insert all model appraisals
                     appraisalData =
@@ -1133,48 +1324,35 @@ updateItem config collections reprocessTag item modelResults =
                         Appraisal.encode appraisalData
                             |> Encode.encode 0
 
-                    -- Use the first model's result for collection placement and star tags
-                    primaryResult =
-                        List.head modelResults
+                    newResultValues =
+                        List.map Tuple.second modelResults
 
-                    primaryDecision =
-                        primaryResult
-                            |> Maybe.map (\( _, r ) -> Classification.relevanceToDecision r.relevance)
-                            |> Maybe.withDefault Classification.Include
+                    -- Star tag: max across existing + new, never downgrade
+                    starRelevance =
+                        maxStarRelevance item.data.tags newResultValues
 
-                    primaryRelevance =
-                        primaryResult
-                            |> Maybe.map (\( _, r ) -> r.relevance)
-                            |> Maybe.withDefault Classification.ThreeStars
+                    -- death_after_therapy: check ALL appraisals (existing + new)
+                    hasDeath =
+                        anyDeathAfterTherapy appraisalData newResultValues
 
-                    primaryDeathAfterTherapy =
-                        primaryResult
-                            |> Maybe.map (\( _, r ) -> r.deathAfterTherapy)
-                            |> Maybe.withDefault False
+                    -- Build per-model target collections from results
+                    perModelCollectionKeys =
+                        modelResults
+                            |> List.filterMap
+                                (\( key, result ) ->
+                                    collectionsForModel key collections
+                                        |> Maybe.map
+                                            (\mc ->
+                                                case Classification.relevanceToDecision result.relevance of
+                                                    Classification.Include ->
+                                                        mc.relevantKey
 
-                    primaryModelKey =
-                        primaryResult
-                            |> Maybe.map Tuple.first
-                            |> Maybe.withDefault ""
+                                                    Classification.Exclude ->
+                                                        mc.irrelevantKey
+                                            )
+                                )
 
-                    -- Target collection from the primary model
-                    targetCollectionKey =
-                        case collectionsForModel primaryModelKey collections of
-                            Just mc ->
-                                case primaryDecision of
-                                    Classification.Include ->
-                                        mc.relevantKey
-
-                                    Classification.Exclude ->
-                                        mc.irrelevantKey
-
-                            Nothing ->
-                                ""
-
-                    -- Strip old star tags, death_after_therapy, all model processed tags, and reprocess tag
-                    allProcessedTags =
-                        List.map modelProcessedTag config.models
-
+                    -- Clean tags: remove star tags and death_after_therapy (we'll re-add the right ones)
                     cleanedTags =
                         item.data.tags
                             |> List.filter
@@ -1182,46 +1360,38 @@ updateItem config collections reprocessTag item modelResults =
                                     not (Classification.isStarTag t.tag)
                                         && t.tag
                                         /= "death_after_therapy"
-                                        && not (List.member t.tag allProcessedTags)
-                                        && not (isReprocessTag reprocessTag t.tag)
                                 )
-
-                    -- Add processed tags for each model that returned a result
-                    newModelTags =
-                        modelResults
-                            |> List.map (\( key, _ ) -> { tag = String.toUpper key })
-
-                    -- Keep existing processed tags for models not in this batch
-                    existingModelTags =
-                        item.data.tags
-                            |> List.filter (\t -> List.member t.tag allProcessedTags)
-                            |> List.filter (\t -> not (List.any (\( key, _ ) -> String.toUpper key == t.tag) modelResults))
 
                     newTags =
                         cleanedTags
-                            ++ existingModelTags
-                            ++ newModelTags
-                            ++ [ { tag = Classification.relevanceToEmoji primaryRelevance } ]
-                            ++ (if primaryDeathAfterTherapy then
+                            ++ [ { tag = Classification.relevanceToEmoji starRelevance } ]
+                            ++ (if hasDeath then
                                     [ { tag = "death_after_therapy" } ]
 
                                 else
                                     []
                                )
 
-                    -- Add target + version collections, remove old version keys
+                    -- Collections: add per-model targets + version, remove source if all succeeded
                     allVersionKeys =
                         Dict.values collections.versionKeys
 
-                    collectionsWithoutOldVersions =
+                    baseCollections =
                         item.data.collections
                             |> List.filter (\c -> not (List.member c allVersionKeys))
 
+                    collectionsWithoutSource =
+                        if allSucceeded then
+                            baseCollections |> List.filter (\c -> c /= collections.sourceKey)
+
+                        else
+                            baseCollections
+
                     newCollections =
-                        (collectionsWithoutOldVersions
-                            ++ [ targetCollectionKey, collections.currentVersionKey ]
+                        (collectionsWithoutSource
+                            ++ perModelCollectionKeys
+                            ++ [ collections.currentVersionKey ]
                         )
-                            |> List.filter (\c -> c /= "")
                             |> dedup
 
                     noteHtml =
@@ -1236,33 +1406,12 @@ updateItem config collections reprocessTag item modelResults =
             )
 
 
-{-| Resolve the base AppraisalData for an item.
+{-| Resolve the base AppraisalData for an item (migration mode).
 
   - If callNumber has valid JSON, decode it.
   - If callNumber is empty but item has legacy CLAUDE data, migrate from tags.
   - Otherwise, start empty.
 
-Note: legacy migration without note HTML — the full migration including note
-content happens lazily when we GET child notes during reprocessing.
-
--}
-resolveAppraisalData : ZoteroApi.ZoteroItem -> Appraisal.AppraisalData
-resolveAppraisalData item =
-    (case Decode.decodeString Appraisal.decode item.data.callNumber of
-        Ok data ->
-            data
-
-        Err _ ->
-            Appraisal.migrateFromLegacy
-                { tags = item.data.tags
-                , reasoningNoteHtml = Nothing
-                }
-                |> Maybe.withDefault Appraisal.empty
-    )
-        |> Appraisal.migrateToCurrentVersion
-
-
-{-| Resolve AppraisalData with note content for full legacy migration.
 -}
 resolveAppraisalDataWithNotes : ZoteroApi.ZoteroItem -> Maybe String -> Appraisal.AppraisalData
 resolveAppraisalDataWithNotes item reasoningNoteHtml =
@@ -1337,8 +1486,6 @@ fetchItemsForMigration config collections fromVersion limit =
         startVersion =
             fromVersion |> Maybe.withDefault 0
 
-        -- Fetch from version collections startVersion..current-1
-        -- version_0 is manually populated with legacy articles
         collectionKeysToFetch =
             List.range startVersion (Appraisal.currentSchemaVersion - 1)
                 |> List.filterMap (\v -> Dict.get v collections.versionKeys)
@@ -1575,7 +1722,6 @@ migrateBatch :
     -> Stats
     -> BackendTask FatalError Stats
 migrateBatch config collections items stats =
-    -- Step 1: prepare all patches (sequential, since each needs a child notes GET)
     prepareMigrationPatches config collections items 1 (List.length items) []
         |> BackendTask.andThen
             (\patches ->
@@ -1586,7 +1732,6 @@ migrateBatch config collections items stats =
                     failCount =
                         List.length items - patchCount
                 in
-                -- Step 2: batch upload in chunks of 50
                 sendMigrationChunks config patches
                     |> BackendTask.map
                         (\writeResult ->
@@ -1605,8 +1750,6 @@ migrateBatch config collections items stats =
             )
 
 
-{-| Prepare migration patches for each item sequentially (each needs a child notes GET).
--}
 prepareMigrationPatches :
     Config
     -> Collections
@@ -1639,8 +1782,6 @@ prepareMigrationPatches config collections items idx total acc =
                     )
 
 
-{-| Send prepared patches to Zotero in chunks of 50 (item updates, then note creates).
--}
 sendMigrationChunks : Config -> List MigrationPatch -> BackendTask FatalError (Result String ())
 sendMigrationChunks config patches =
     let
@@ -1678,13 +1819,13 @@ chunk n list =
 -- Batch processing (classification)
 
 
-processAll : Config -> Collections -> Maybe String -> Int -> BackendTask FatalError ()
-processAll config collections reprocessTag maxArticles =
-    processAllHelper config collections reprocessTag maxArticles 1 emptyStats
+processAll : Config -> RunConfig -> Collections -> Int -> BackendTask FatalError ()
+processAll config runConfig collections maxArticles =
+    processAllHelper config runConfig collections maxArticles 1 emptyStats
 
 
-processAllHelper : Config -> Collections -> Maybe String -> Int -> Int -> Stats -> BackendTask FatalError ()
-processAllHelper config collections reprocessTag maxArticles batchNum totalStats =
+processAllHelper : Config -> RunConfig -> Collections -> Int -> Int -> Stats -> BackendTask FatalError ()
+processAllHelper config runConfig collections maxArticles batchNum totalStats =
     let
         batchSize =
             min 100
@@ -1699,11 +1840,11 @@ processAllHelper config collections reprocessTag maxArticles batchNum totalStats
             "\n" ++ String.repeat 60 "=" ++ "\nBATCH " ++ String.fromInt batchNum ++ "\n" ++ String.repeat 60 "="
     in
     Script.log batchHeader
-        |> BackendTask.andThen (\_ -> fetchItems config reprocessTag batchSize)
+        |> BackendTask.andThen (\_ -> fetchFromSourceCollection config collections batchSize)
         |> BackendTask.andThen
             (\items ->
                 Script.log ("\n📚 Processing " ++ String.fromInt (List.length items) ++ " articles...")
-                    |> BackendTask.andThen (\_ -> processBatch config collections reprocessTag items 1 (List.length items) emptyStats)
+                    |> BackendTask.andThen (\_ -> processBatch config runConfig collections items 1 (List.length items) emptyStats)
             )
         |> BackendTask.andThen
             (\batchStats ->
@@ -1724,21 +1865,21 @@ processAllHelper config collections reprocessTag maxArticles batchNum totalStats
 
                             else
                                 Script.log "\nWaiting before next batch..."
-                                    |> BackendTask.andThen (\_ -> processAllHelper config collections reprocessTag maxArticles (batchNum + 1) newTotal)
+                                    |> BackendTask.andThen (\_ -> processAllHelper config runConfig collections maxArticles (batchNum + 1) newTotal)
                         )
             )
 
 
 processBatch :
     Config
+    -> RunConfig
     -> Collections
-    -> Maybe String
     -> List ZoteroApi.ZoteroItem
     -> Int
     -> Int
     -> Stats
     -> BackendTask FatalError Stats
-processBatch config collections reprocessTag items idx total stats =
+processBatch config runConfig collections items idx total stats =
     case items of
         [] ->
             BackendTask.succeed stats
@@ -1749,7 +1890,7 @@ processBatch config collections reprocessTag items idx total stats =
                     ZoteroApi.articleDataFromItem item
             in
             Script.log ("\n[" ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ "] " ++ String.left 60 article.title ++ "...")
-                |> BackendTask.andThen (\_ -> processArticle config collections reprocessTag item stats)
+                |> BackendTask.andThen (\_ -> processArticle config runConfig collections item stats)
                 |> BackendTask.andThen
                     (\( newStats, errAction ) ->
                         case errAction of
@@ -1761,10 +1902,10 @@ processBatch config collections reprocessTag items idx total stats =
                                 logCircuitBreaker "\n⏸️  Circuit breaker: 5 HTTP errors in the last 5 minutes — taking a 5-minute break" newStats
                                     |> BackendTask.andThen (\_ -> Script.sleep 300000)
                                     |> BackendTask.andThen (\_ -> Script.log "\n▶️  Resuming after break...")
-                                    |> BackendTask.andThen (\_ -> processBatch config collections reprocessTag (item :: rest) idx total { newStats | recentErrorTimestamps = [] })
+                                    |> BackendTask.andThen (\_ -> processBatch config runConfig collections (item :: rest) idx total { newStats | recentErrorTimestamps = [] })
 
                             Continue ->
-                                processBatch config collections reprocessTag rest (idx + 1) total newStats
+                                processBatch config runConfig collections rest (idx + 1) total newStats
                     )
 
 
@@ -1773,32 +1914,44 @@ Returns updated stats and the circuit breaker action to take.
 -}
 processArticle :
     Config
+    -> RunConfig
     -> Collections
-    -> Maybe String
     -> ZoteroApi.ZoteroItem
     -> Stats
     -> BackendTask FatalError ( Stats, CircuitBreakerAction )
-processArticle config collections reprocessTag item stats =
+processArticle config runConfig collections item stats =
     let
         article =
             ZoteroApi.articleDataFromItem item
 
-        -- Only run models that haven't screened this item yet (unless reprocessing)
         applicableModels =
-            case reprocessTag of
-                Just _ ->
-                    config.models
-
-                Nothing ->
-                    modelsNeedingScreening config.models item
+            modelsForArticle runConfig item
 
         modelNames =
             applicableModels |> List.map .key |> String.join ", "
     in
     if List.isEmpty applicableModels then
-        -- All models have already screened this item
-        Script.log "  → Already screened by all models, skipping"
-            |> BackendTask.map (\_ -> ( stats, Continue ))
+        -- All selected models have already screened this item — clean up by removing from source
+        Script.log "  → Already screened by all selected models, removing from source"
+            |> BackendTask.andThen
+                (\_ ->
+                    let
+                        newCollections =
+                            item.data.collections
+                                |> List.filter (\c -> c /= collections.sourceKey)
+                    in
+                    if newCollections /= item.data.collections then
+                        patchItem config
+                            item
+                            { tags = item.data.tags
+                            , collections = newCollections
+                            , callNumber = item.data.callNumber
+                            }
+                            |> BackendTask.map (\_ -> ( stats, Continue ))
+
+                    else
+                        BackendTask.succeed ( stats, Continue )
+                )
 
     else
         Script.log ("  → Screening with: " ++ modelNames)
@@ -1829,13 +1982,14 @@ processArticle config collections reprocessTag item stats =
                                             Ok _ ->
                                                 Nothing
                                     )
+
+                        allSucceeded =
+                            List.isEmpty failures
                     in
-                    -- Log each result
                     logModelResults successes failures
                         |> BackendTask.andThen
                             (\_ ->
                                 if List.isEmpty successes then
-                                    -- All models failed
                                     let
                                         errMsg =
                                             failures |> List.map (\( k, msg ) -> k ++ ": " ++ msg) |> String.join "; "
@@ -1843,8 +1997,7 @@ processArticle config collections reprocessTag item stats =
                                     handleArticleError errMsg stats
 
                                 else
-                                    -- At least one model succeeded — update the item
-                                    updateItem config collections reprocessTag item successes
+                                    updateItem config collections item successes allSucceeded
                                         |> BackendTask.andThen
                                             (\updateResult ->
                                                 case updateResult of
@@ -1853,16 +2006,15 @@ processArticle config collections reprocessTag item stats =
                                                             newStats =
                                                                 updateStatsFromResults stats successes
                                                         in
-                                                        if List.isEmpty failures then
+                                                        if allSucceeded then
                                                             BackendTask.succeed ( newStats, Continue )
 
                                                         else
-                                                            -- Partial success — log failures but don't circuit-break
                                                             let
                                                                 failMsg =
                                                                     failures |> List.map Tuple.first |> String.join ", "
                                                             in
-                                                            Script.log ("  ⚠ Partial: " ++ failMsg ++ " failed, but item updated with successful results")
+                                                            Script.log ("  ⚠ Partial: " ++ failMsg ++ " failed, but item updated with successful results (kept in source)")
                                                                 |> BackendTask.map (\_ -> ( newStats, Continue ))
 
                                                     Err updateErr ->

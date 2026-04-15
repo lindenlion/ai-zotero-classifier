@@ -4,14 +4,30 @@
 
 The one where we stopped assuming Claude is the only game in town and let multiple AI models screen articles side by side. Democracy in action, or at least a vigorous peer review.
 
+### Collection-Based Screening Workflow
+- New source collection model: a human fills a Zotero collection (e.g. "Screening queue") with articles to screen
+- Articles removed from source collection only when ALL selected models succeed — partial failures stay queued for retry
+- No more processed tags — the appraisals dict in `callNumber` is the sole source of truth
+- Per-model included/excluded collections (e.g. "Claude included", "Deepseek excluded") created automatically
+- Duplicate collection name detection: fatal error if any needed collection name appears more than once in your library
+
+### Runtime Model Selection
+- `--models claude,deepseek` CLI flag selects which models to run (default: all enabled models in `config.json`)
+- `--reprocess claude` forces re-run of specified models, overwriting existing appraisals
+- `--models` and `--reprocess` cannot be combined — the script will politely explain why
+- `--max` can be combined with any flag; `--migrate` is its own mode and cannot combine with `--models` or `--reprocess`
+
 ### Multi-Model Screening
 - New `config.json` config file defines AI models, each with a key, API format, model name, base URL, and API key env var name
 - Supported API formats: `anthropic` (Claude) and `openai` (OpenAI-compatible — DeepSeek, etc.)
 - Multiple models run in parallel per article using `BackendTask.andMap` — no waiting in line
 - Each model stores its appraisal under its own key in the `callNumber` JSON (e.g. `"claude"`, `"deepseek"`)
-- Per-model processed tags (e.g. `CLAUDE`, `DEEPSEEK`) — articles only screened by models that haven't seen them yet
-- Per-model Zotero collections for include/exclude sorting (e.g. "Claude included", "Deepseek included")
-- First model's decision drives star tags and primary collection placement
+- Per-model `enabled` field in `config.json` — disable a model without removing it from config
+
+### Star Tag Logic
+- Star rating = maximum across all existing + new appraisals (never downgraded)
+- If an article already has 5 stars from Claude and DeepSeek gives it 1 star, the 5-star tag stays put
+- `death_after_therapy` tag added if ANY model flags it, removed only when none do
 
 ### New Module: OpenAiApi.elm
 - Encoder/decoder for OpenAI-compatible chat completions API
@@ -20,21 +36,19 @@ The one where we stopped assuming Claude is the only game in town and let multip
 
 ### Configuration Overhaul
 - `config.json` replaces `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` env vars for model config
+- New `sourceCollection` field in `config.json` names the collection to fetch articles from
 - Zotero library ID now lives in `config.json` (not a secret, just user-specific)
-- All model fields are required (no optional fields): `key`, `apiFormat`, `model`, `apiKeyEnvVar`, `baseUrl`
+- All model fields are required (no optional fields): `key`, `apiFormat`, `model`, `apiKeyEnvVar`, `baseUrl`, `enabled`
 - API keys still resolved from env vars (names configured per model in `config.json`)
 - `ZOTERO_API_KEY` still from `.env` / `secrets.txt` as before
 - Fallback key file renamed from `config.txt` to `secrets.txt` — because that's what it contains
 - Template provided: `config.json.template`
 
-### Fetch Logic
-- Fetches articles per-model (missing that model's tag), merges and deduplicates
-- Per-article, only runs models whose processed tag is absent — efficient incremental screening
-- Reprocess mode still works: runs all configured models regardless of existing tags
-
 ### Housekeeping
-- Partial success handling: if one model fails but another succeeds, the item is still updated
+- Articles already fully screened are quietly cleaned out of the source collection during processing — no wasted API calls
+- Partial success handling: if one model fails but another succeeds, successful results are written and the article stays in the source collection for retry
 - Classification logging now shows per-model results with `[model]` prefixes
+- Removed all processed-tag logic (`modelProcessedTag`, `allProcessedTags`, tag-based fetching)
 - 145 tests passing, zero elm-review errors
 
 ## v0.2.0 — The Great Migration
