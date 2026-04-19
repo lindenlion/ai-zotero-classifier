@@ -435,7 +435,8 @@ extractTodoNote html =
         ""
 
 
-{-| Strip trailing </p> and </div> tags from extracted content. -}
+{-| Strip trailing </p> and </div> tags from extracted content.
+-}
 stripTrailingCloseTags : String -> String
 stripTrailingCloseTags str =
     str

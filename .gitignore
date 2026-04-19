@@ -1,6 +1,8 @@
 .claude/
 .devbox/
 .env
+config.json
+secrets.txt
 .vscode/
 node_modules/
 elm-stuff/

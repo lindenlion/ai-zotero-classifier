@@ -11,7 +11,9 @@ src/libs/
   Classification.elm              Relevance types, decision logic, JSON decoders
   ZoteroApi.elm                   Zotero item/collection types, JSON codecs, article extraction
   AnthropicApi.elm                Anthropic Messages API types, request encoder, response decoder
+  OpenAiApi.elm                   OpenAI-compatible chat API encoder/decoder (DeepSeek, etc.)
   Stats.elm                       Batch statistics and circuit breaker logic
+config.json                       Model configuration: which AI models to use (from template)
 prompt.txt                        System prompt for article classification (loaded at runtime)
 tests/                            Tests (elm-test-rs)
 review/                           elm-review config (NoUnused, NoDebug, Simplify rules)
@@ -32,13 +34,25 @@ npm install   # only needed once
 
 ```bash
 cp .env_template .env
+cp config.json.template config.json
 ```
 
-Fill in `.env` (loaded automatically by devbox shell):
-- `ZOTERO_LIBRARY_ID` — your library/group id from https://www.zotero.org/mylibrary
+Fill in `.env` with API keys (loaded automatically by devbox shell, or save as `secrets.txt`):
 - `ZOTERO_API_KEY` — create at https://www.zotero.org/settings/keys/new (read/write + notes access)
 - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/settings/keys
-- `ANTHROPIC_MODEL` — e.g. `claude-sonnet-4-6`
+- `DEEPSEEK_API_KEY` — from https://platform.deepseek.com/api_keys
+
+Fill in `config.json` with model configuration:
+- `zoteroLibraryId` — your library/group id from https://www.zotero.org/mylibrary
+- `sourceCollection` — name of the Zotero collection to fetch articles from (manually filled by the user)
+- `models` — array of AI models to use for screening. Each model needs:
+  - `key` — identifier used in appraisals and collection names (e.g. "claude", "deepseek")
+  - `apiFormat` — `"anthropic"` or `"openai"` (OpenAI-compatible, e.g. DeepSeek)
+  - `model` — exact model name sent in API calls (e.g. "claude-opus-4-6", "deepseek-reasoner")
+  - `apiKeyEnvVar` — name of the env var holding the API key (e.g. "ANTHROPIC_API_KEY")
+  - `baseUrl` — API base URL (e.g. "https://api.anthropic.com", "https://api.deepseek.com")
+  - `enabled` — `true` to include in default model set, `false` to skip unless explicitly selected with `--models`
+  - `maxTokens` — maximum output tokens for this model's API calls
 
 ## Commands
 
@@ -46,6 +60,8 @@ Fill in `.env` (loaded automatically by devbox shell):
 npm run classify                    # run classifier (prompted for batch size)
 npm run classify -- --max 50        # process 50 articles
 npm run classify:all                # process all unprocessed articles
+npm run classify -- --models claude # run only Claude (comma-separated for multiple)
+npm run classify -- --reprocess deepseek      # force re-run DeepSeek, overwriting existing appraisals
 npm run classify -- --migrate       # migrate all legacy articles (no AI calls)
 npm run classify -- --migrate 0     # migrate from version 0 (legacy)
 npm run test                        # run all tests (elm-test-rs)
@@ -55,6 +71,11 @@ npm run review:deps                 # check for unused Elm dependencies
 npm run format                      # auto-format src/ and tests/ with elm-format
 npm run build                       # bundle optimized script to ./build/
 ```
+
+### CLI flag rules
+- `--max` can be combined with any flag
+- `--models` and `--reprocess` cannot be combined (fatal error with explanation)
+- `--migrate` cannot be combined with `--models` or `--reprocess`
 
 ## Links
 
