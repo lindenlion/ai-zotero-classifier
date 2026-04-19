@@ -52,6 +52,7 @@ Fill in `config.json` with model configuration:
   - `apiKeyEnvVar` — name of the env var holding the API key (e.g. "ANTHROPIC_API_KEY")
   - `baseUrl` — API base URL (e.g. "https://api.anthropic.com", "https://api.deepseek.com")
   - `enabled` — `true` to include in default model set, `false` to skip unless explicitly selected with `--models`
+  - `maxTokens` — maximum output tokens for this model's API calls
 
 ## Commands
 

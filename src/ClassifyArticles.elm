@@ -44,6 +44,7 @@ type alias ModelConfig =
     , apiKey : String
     , baseUrl : String
     , enabled : Bool
+    , maxTokens : Int
     }
 
 
@@ -442,6 +443,7 @@ type alias ConfigModelJson =
     , apiKeyEnvVar : String
     , baseUrl : String
     , enabled : Bool
+    , maxTokens : Int
     }
 
 
@@ -484,13 +486,14 @@ configJsonDecoder =
 
 configModelJsonDecoder : Decode.Decoder ConfigModelJson
 configModelJsonDecoder =
-    Decode.map6 ConfigModelJson
+    Decode.map7 ConfigModelJson
         (Decode.field "key" Decode.string)
         (Decode.field "apiFormat" Decode.string)
         (Decode.field "model" Decode.string)
         (Decode.field "apiKeyEnvVar" Decode.string)
         (Decode.field "baseUrl" Decode.string)
         (Decode.field "enabled" Decode.bool)
+        (Decode.field "maxTokens" Decode.int)
 
 
 {-| Resolve ZOTERO\_API\_KEY from env or secrets.txt fallback.
@@ -569,6 +572,7 @@ resolveModelApiKeysHelper models fileVars acc =
                                 , apiKey = apiKey
                                 , baseUrl = m.baseUrl
                                 , enabled = m.enabled
+                                , maxTokens = m.maxTokens
                                 }
                         in
                         resolveModelApiKeysHelper rest fileVars (modelConfig :: acc)
@@ -1068,12 +1072,12 @@ classifyWithAnthropic modelConfig systemPrompt userMessage =
         requestBody =
             AnthropicApi.encodeMessageRequest
                 { model = modelConfig.model
-                , maxTokens = 1000
+                , maxTokens = modelConfig.maxTokens
                 , systemPrompt = systemPrompt
                 , userMessage = userMessage
                 }
     in
-    loggedRequest ("Anthropic API (" ++ modelConfig.key ++ ")")
+    loggedRequest (modelConfig.key ++ " (Anthropic API)")
         { url = modelConfig.baseUrl ++ "/v1/messages"
         , method = "POST"
         , headers =
@@ -1095,12 +1099,12 @@ classifyWithOpenAi modelConfig systemPrompt userMessage =
         requestBody =
             OpenAiApi.encodeChatRequest
                 { model = modelConfig.model
-                , maxTokens = 1000
+                , maxTokens = modelConfig.maxTokens
                 , systemPrompt = systemPrompt
                 , userMessage = userMessage
                 }
     in
-    loggedRequest ("OpenAI-compatible API (" ++ modelConfig.key ++ ")")
+    loggedRequest (modelConfig.key ++ " (OpenAI-compatible API)")
         { url = modelConfig.baseUrl ++ "/chat/completions"
         , method = "POST"
         , headers =
@@ -1220,30 +1224,29 @@ modelsForArticle runConfig item =
             |> List.filter (\m -> not (Set.member m.key existingAppraisalKeys))
 
 
-{-| Compute the maximum star rating across existing tags and new results.
-Never downgrades — returns the highest relevance.
+{-| Compute the minimum star rating across existing tags and new results.
+The most conservative model wins — returns the lowest relevance.
 -}
-maxStarRelevance : List ZoteroApi.ZoteroTag -> List Classification.ClassificationResult -> Classification.Relevance
-maxStarRelevance existingTags newResults =
+minStarRelevance : List ZoteroApi.ZoteroTag -> List Classification.ClassificationResult -> Maybe Classification.Relevance
+minStarRelevance existingTags newResults =
     let
-        existingMax =
+        existingStars =
             existingTags
                 |> List.filterMap (\t -> Classification.emojiToRelevance t.tag)
                 |> List.map Classification.relevanceToInt
-                |> List.maximum
-                |> Maybe.withDefault 0
 
-        newMax =
+        newStars =
             newResults
                 |> List.map (\r -> Classification.relevanceToInt r.relevance)
-                |> List.maximum
-                |> Maybe.withDefault 0
+
+        allStars =
+            existingStars ++ newStars
 
         finalInt =
-            max existingMax newMax
+            List.minimum allStars
+                |> Maybe.withDefault 0
     in
     Classification.intToRelevance finalInt
-        |> Maybe.withDefault Classification.ThreeStars
 
 
 {-| Check if death_after_therapy is flagged by ANY appraisal (existing or new).
@@ -1327,9 +1330,9 @@ updateItem config collections item modelResults allSucceeded =
                     newResultValues =
                         List.map Tuple.second modelResults
 
-                    -- Star tag: max across existing + new, never downgrade
+                    -- Star tag: min across existing + new, most conservative wins
                     starRelevance =
-                        maxStarRelevance item.data.tags newResultValues
+                        minStarRelevance item.data.tags newResultValues
 
                     -- death_after_therapy: check ALL appraisals (existing + new)
                     hasDeath =
@@ -1364,7 +1367,13 @@ updateItem config collections item modelResults allSucceeded =
 
                     newTags =
                         cleanedTags
-                            ++ [ { tag = Classification.relevanceToEmoji starRelevance } ]
+                            ++ ( case starRelevance of 
+                                Just stars ->
+                                    [ { tag = Classification.relevanceToEmoji stars } ]
+
+                                Nothing ->
+                                    []
+                               )
                             ++ (if hasDeath then
                                     [ { tag = "death_after_therapy" } ]
 

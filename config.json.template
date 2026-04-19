@@ -8,7 +8,8 @@
       "model": "claude-opus-4-6",
       "apiKeyEnvVar": "ANTHROPIC_API_KEY",
       "baseUrl": "https://api.anthropic.com",
-      "enabled": true
+      "enabled": true,
+      "maxTokens": 1000
     },
     {
       "key": "deepseek",
@@ -16,7 +17,8 @@
       "model": "deepseek-reasoner",
       "apiKeyEnvVar": "DEEPSEEK_API_KEY",
       "baseUrl": "https://api.deepseek.com",
-      "enabled": true
+      "enabled": true,
+      "maxTokens": 5000
     }
   ]
 }

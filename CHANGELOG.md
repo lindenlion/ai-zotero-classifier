@@ -25,8 +25,8 @@ The one where we stopped assuming Claude is the only game in town and let multip
 - Per-model `enabled` field in `config.json` — disable a model without removing it from config
 
 ### Star Tag Logic
-- Star rating = maximum across all existing + new appraisals (never downgraded)
-- If an article already has 5 stars from Claude and DeepSeek gives it 1 star, the 5-star tag stays put
+- Star rating = minimum across all existing + new appraisals — the most conservative model wins
+- If Claude gives 5 stars but DeepSeek gives 1 star, the article gets 1 star (trust the sceptic)
 - `death_after_therapy` tag added if ANY model flags it, removed only when none do
 
 ### New Module: OpenAiApi.elm
@@ -38,7 +38,8 @@ The one where we stopped assuming Claude is the only game in town and let multip
 - `config.json` replaces `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` env vars for model config
 - New `sourceCollection` field in `config.json` names the collection to fetch articles from
 - Zotero library ID now lives in `config.json` (not a secret, just user-specific)
-- All model fields are required (no optional fields): `key`, `apiFormat`, `model`, `apiKeyEnvVar`, `baseUrl`, `enabled`
+- All model fields are required (no optional fields): `key`, `apiFormat`, `model`, `apiKeyEnvVar`, `baseUrl`, `enabled`, `maxTokens`
+- `maxTokens` per model — no more hardcoded token limits;
 - API keys still resolved from env vars (names configured per model in `config.json`)
 - `ZOTERO_API_KEY` still from `.env` / `secrets.txt` as before
 - Fallback key file renamed from `config.txt` to `secrets.txt` — because that's what it contains
