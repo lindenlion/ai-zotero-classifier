@@ -1953,12 +1953,16 @@ migrateBatch config collections items stats =
                                 Ok _ ->
                                     { stats
                                         | processed = stats.processed + patchCount
+                                        , completed = stats.completed + patchCount
+                                        , failed = stats.failed + failCount
                                         , errors = stats.errors + failCount
                                     }
 
                                 Err _ ->
                                     { stats
-                                        | errors = stats.errors + List.length items
+                                        | processed = stats.processed + List.length items
+                                        , failed = stats.failed + List.length items
+                                        , errors = stats.errors + List.length items
                                     }
                         )
             )
@@ -2193,8 +2197,11 @@ processArticle config runConfig collections item stats =
                                     let
                                         errMsg =
                                             failures |> List.map (\( k, msg ) -> k ++ ": " ++ msg) |> String.join "; "
+
+                                        failedStats =
+                                            updateStatsFromResults stats [] failures
                                     in
-                                    handleArticleError errMsg stats
+                                    handleArticleError errMsg failedStats
 
                                 else
                                     updateItem config collections item successes allSucceeded
@@ -2204,7 +2211,7 @@ processArticle config runConfig collections item stats =
                                                     Ok _ ->
                                                         let
                                                             newStats =
-                                                                updateStatsFromResults stats successes
+                                                                updateStatsFromResults stats successes failures
                                                         in
                                                         if allSucceeded then
                                                             BackendTask.succeed ( newStats, Continue )
@@ -2218,7 +2225,12 @@ processArticle config runConfig collections item stats =
                                                                 |> BackendTask.map (\_ -> ( newStats, Continue ))
 
                                                     Err updateErr ->
-                                                        handleArticleError ("Update failed — " ++ updateErr) stats
+                                                        handleArticleError ("Update failed — " ++ updateErr)
+                                                            { stats
+                                                                | processed = stats.processed + 1
+                                                                , failed = stats.failed + 1
+                                                                , errors = stats.errors + 1
+                                                            }
                                             )
                             )
                 )
@@ -2253,29 +2265,52 @@ logModelResults successes failures =
     Script.log (String.join "\n" allLogs)
 
 
-{-| Update stats based on successful model results. Uses the first model's decision.
+{-| Update stats based on all model results for a single article.
+Counts every model's decision individually, and tracks the article-level outcome.
 -}
-updateStatsFromResults : Stats -> List ( String, Classification.ClassificationResult ) -> Stats
-updateStatsFromResults stats successes =
+updateStatsFromResults : Stats -> List ( String, Classification.ClassificationResult ) -> List ( String, String ) -> Stats
+updateStatsFromResults stats successes failures =
     let
-        newStats =
-            { stats | processed = stats.processed + 1 }
-    in
-    case List.head successes of
-        Just ( _, result ) ->
-            if Classification.isRefusal result then
-                { newStats | refusals = newStats.refusals + 1 }
+        countDecisions s results =
+            case results of
+                [] ->
+                    s
+
+                ( _, result ) :: rest ->
+                    let
+                        updated =
+                            if Classification.isRefusal result then
+                                { s | refusals = s.refusals + 1 }
+
+                            else
+                                case Classification.relevanceToDecision result.relevance of
+                                    Classification.Include ->
+                                        { s | included = s.included + 1 }
+
+                                    Classification.Exclude ->
+                                        { s | excluded = s.excluded + 1 }
+                    in
+                    countDecisions updated rest
+
+        errorCount =
+            List.length failures
+
+        articleOutcome =
+            if List.isEmpty failures then
+                { stats | completed = stats.completed + 1 }
+
+            else if List.isEmpty successes then
+                { stats | failed = stats.failed + 1 }
 
             else
-                case Classification.relevanceToDecision result.relevance of
-                    Classification.Include ->
-                        { newStats | included = newStats.included + 1 }
-
-                    Classification.Exclude ->
-                        { newStats | excluded = newStats.excluded + 1 }
-
-        Nothing ->
-            newStats
+                { stats | partial = stats.partial + 1 }
+    in
+    countDecisions
+        { articleOutcome
+            | processed = articleOutcome.processed + 1
+            , errors = articleOutcome.errors + errorCount
+        }
+        successes
 
 
 logCircuitBreaker : String -> Stats -> BackendTask FatalError ()

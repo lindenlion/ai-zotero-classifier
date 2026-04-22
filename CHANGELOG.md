@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.4.2 — Stats that actually tell the truth
+
+### Two-tier stats reporting
+
+Previously, stats used only the first successful model's decision — if Model A included, Model B refused, and Model C errored, you'd just see "included: 1". The error and refusal were invisible. Not ideal when you're trying to figure out why your screening run looked weird.
+
+Stats now track two levels:
+
+**Article-level** — what happened to your articles:
+- `processed`: total articles attempted
+- `completed`: all models succeeded, article removed from source
+- `partial`: some models failed, article kept in source for retry
+- `failed`: all models failed, article skipped entirely
+
+**Model-level** — how did the models actually perform:
+- `include/exclude/refusals/errors`: counts every individual model call outcome
+
+New summary format:
+```
+Articles:  25 processed (20 completed, 3 partial, 2 failed)
+Decisions: 55 include, 12 exclude, 3 refusals, 5 errors
+```
+
+With a single model, article and decision counts naturally align — so it's not noisier unless you're running multiple models.
+
+Also fixed: `recordErrorAndCheck` (circuit breaker) no longer sneakily increments the error count — callers now handle error counting explicitly, which avoids double-counting when model errors are already tracked by `updateStatsFromResults`.
+
+
 ## v0.4.1 — Escape from the never-ending migration loop
 
 ### Bug fix

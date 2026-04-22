@@ -63,13 +63,13 @@ suite =
                             Stats.recordErrorAndCheck 301000 stats
                     in
                     Expect.equal [ 301000 ] newStats.recentErrorTimestamps
-            , test "increments error count" <|
+            , test "does not increment error count (caller is responsible)" <|
                 \_ ->
                     let
                         ( newStats, _ ) =
                             Stats.recordErrorAndCheck 1000 emptyStats
                     in
-                    Expect.equal 1 newStats.errors
+                    Expect.equal 0 newStats.errors
             ]
         , describe "formatErrorTimestamps"
             [ test "formats seconds for recent errors" <|
@@ -94,18 +94,30 @@ suite =
                 \_ ->
                     let
                         stats =
-                            { emptyStats | processed = 10, included = 7, excluded = 2, refusals = 1, errors = 0 }
+                            { emptyStats
+                                | processed = 10
+                                , completed = 7
+                                , partial = 2
+                                , failed = 1
+                                , included = 8
+                                , excluded = 3
+                                , refusals = 1
+                                , errors = 2
+                            }
 
                         result =
                             Stats.formatSummary "TEST HEADING" stats
                     in
                     Expect.all
                         [ \s -> String.contains "TEST HEADING" s |> Expect.equal True
-                        , \s -> String.contains "Processed: 10" s |> Expect.equal True
-                        , \s -> String.contains "Included:  7" s |> Expect.equal True
-                        , \s -> String.contains "Excluded:  2" s |> Expect.equal True
-                        , \s -> String.contains "Refusals:  1" s |> Expect.equal True
-                        , \s -> String.contains "Errors:    0" s |> Expect.equal True
+                        , \s -> String.contains "10 processed" s |> Expect.equal True
+                        , \s -> String.contains "7 completed" s |> Expect.equal True
+                        , \s -> String.contains "2 partial" s |> Expect.equal True
+                        , \s -> String.contains "1 failed" s |> Expect.equal True
+                        , \s -> String.contains "8 include" s |> Expect.equal True
+                        , \s -> String.contains "3 exclude" s |> Expect.equal True
+                        , \s -> String.contains "1 refusals" s |> Expect.equal True
+                        , \s -> String.contains "2 errors" s |> Expect.equal True
                         ]
                         result
             ]
@@ -114,20 +126,41 @@ suite =
                 \_ ->
                     let
                         a =
-                            { emptyStats | processed = 5, included = 3, excluded = 1, refusals = 1, errors = 0 }
+                            { emptyStats
+                                | processed = 5
+                                , completed = 3
+                                , partial = 1
+                                , failed = 1
+                                , included = 4
+                                , excluded = 2
+                                , refusals = 1
+                                , errors = 0
+                            }
 
                         b =
-                            { emptyStats | processed = 3, included = 2, excluded = 1, refusals = 0, errors = 0 }
+                            { emptyStats
+                                | processed = 3
+                                , completed = 2
+                                , partial = 1
+                                , failed = 0
+                                , included = 3
+                                , excluded = 1
+                                , refusals = 0
+                                , errors = 1
+                            }
 
                         result =
                             Stats.addStats a b
                     in
                     Expect.all
                         [ \s -> Expect.equal 8 s.processed
-                        , \s -> Expect.equal 5 s.included
-                        , \s -> Expect.equal 2 s.excluded
+                        , \s -> Expect.equal 5 s.completed
+                        , \s -> Expect.equal 2 s.partial
+                        , \s -> Expect.equal 1 s.failed
+                        , \s -> Expect.equal 7 s.included
+                        , \s -> Expect.equal 3 s.excluded
                         , \s -> Expect.equal 1 s.refusals
-                        , \s -> Expect.equal 0 s.errors
+                        , \s -> Expect.equal 1 s.errors
                         ]
                         result
             , test "takes recentErrorTimestamps from second argument" <|

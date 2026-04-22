@@ -3,18 +3,35 @@ module Stats exposing
     , Stats
     , addStats
     , emptyStats
-    , formatErrorTimestamps
     , formatSummary
+    , formatErrorTimestamps
     , recordErrorAndCheck
     )
 
 
+{-| Two-tier stats: article-level outcomes and model-level decision counts.
+
+Article level tracks what happened to each article:
+  - processed, completed, partial, failed
+
+Model level tracks individual model call outcomes:
+  - included, excluded, refusals, errors
+
+-}
 type alias Stats =
-    { processed : Int
+    { -- Article-level
+      processed : Int
+    , completed : Int
+    , partial : Int
+    , failed : Int
+
+    -- Model-level
     , included : Int
     , excluded : Int
     , refusals : Int
     , errors : Int
+
+    -- Circuit breaker
     , recentErrorTimestamps : List Int
     }
 
@@ -22,6 +39,9 @@ type alias Stats =
 emptyStats : Stats
 emptyStats =
     { processed = 0
+    , completed = 0
+    , partial = 0
+    , failed = 0
     , included = 0
     , excluded = 0
     , refusals = 0
@@ -33,6 +53,9 @@ emptyStats =
 addStats : Stats -> Stats -> Stats
 addStats a b =
     { processed = a.processed + b.processed
+    , completed = a.completed + b.completed
+    , partial = a.partial + b.partial
+    , failed = a.failed + b.failed
     , included = a.included + b.included
     , excluded = a.excluded + b.excluded
     , refusals = a.refusals + b.refusals
@@ -65,8 +88,7 @@ recordErrorAndCheck nowMs stats =
 
         newStats =
             { stats
-                | errors = stats.errors + 1
-                , recentErrorTimestamps = pruned
+                | recentErrorTimestamps = pruned
             }
     in
     if List.length pruned < 5 then
@@ -118,10 +140,23 @@ formatSummary heading stats =
     [ "\n" ++ String.repeat 60 "="
     , heading
     , String.repeat 60 "="
-    , "   Processed: " ++ String.fromInt stats.processed
-    , "   Included:  " ++ String.fromInt stats.included
-    , "   Excluded:  " ++ String.fromInt stats.excluded
-    , "   Refusals:  " ++ String.fromInt stats.refusals
-    , "   Errors:    " ++ String.fromInt stats.errors
+    , "   Articles:  "
+        ++ String.fromInt stats.processed
+        ++ " processed ("
+        ++ String.fromInt stats.completed
+        ++ " completed, "
+        ++ String.fromInt stats.partial
+        ++ " partial, "
+        ++ String.fromInt stats.failed
+        ++ " failed)"
+    , "   Decisions: "
+        ++ String.fromInt stats.included
+        ++ " include, "
+        ++ String.fromInt stats.excluded
+        ++ " exclude, "
+        ++ String.fromInt stats.refusals
+        ++ " refusals, "
+        ++ String.fromInt stats.errors
+        ++ " errors"
     ]
         |> String.join "\n"
