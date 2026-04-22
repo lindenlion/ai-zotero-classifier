@@ -24,9 +24,10 @@ sampleAppraisal =
 
 sampleData : Appraisal.AppraisalData
 sampleData =
-    { version = 1
+    { version = 2
     , appraisals = Dict.singleton "claude" sampleAppraisal
     , asreview = Nothing
+    , analysis = Nothing
     }
 
 

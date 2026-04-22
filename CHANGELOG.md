@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.4.0 — The Triage Tribunal
+
+The one where three AI models stop just filing opinions and start actually reaching a verdict. Every article now gets a score, a category, and a collection — no more squinting at individual appraisals wondering what it all means.
+
+### Decision Analysis (Inline)
+
+- Automatic decision analysis computed whenever all enabled models have appraised an article — no manual step needed
+- New `Analysis.elm` module handles all scoring logic
+- Aggregate scores stored in callNumber JSON:
+  - `totalStars`: sum of relevance across all models (range 3–15)
+  - `inclusions`: count of models that voted INCLUDE (relevance ≥ 3)
+  - `exclusions`: count of models that voted EXCLUDE
+  - `category`: one of `auto-excluded`, `human-review`, or `auto-included`
+
+### Category Rules
+
+- **Auto-excluded** (≤5 stars AND 3 exclusions): unanimous rejection — tagged ❌, moved to "AI auto-excluded" collection
+- **Human review** (everything else): needs a human eye — sorted into "Sum of N stars" collections (one per star total, 5–15)
+  - Tagged by exclusion count: ⭕⭕⭕ (3), ⭕⭕ (2), ⭕ (1)
+  - Covers the edge case of 5 stars with < 3 exclusions (the lone dissenter)
+- **Auto-included** (≥9 stars AND 0 exclusions): strong consensus — tagged ✅, moved to "AI auto-included" collection
+
+### Collections
+
+- Two new fixed collections created at startup: "AI auto-included" and "AI auto-excluded"
+- Eight "Sum of N stars" collections (5 through 12) created at startup for human review triage — 13+ stars is impossible with any exclusions (max with 1 exclusion = 5+5+2 = 12)
+- All new collections checked for duplicate names alongside existing model collections
+- Per-model included/excluded collections continue to work as before
+
+### Schema v2
+
+- `AppraisalData` gains an `analysis : Maybe AnalysisData` field
+- Schema version bumped from 1 to 2
+- v1 → v2 migration sets `analysis = Nothing` (analysis computed on next full classification)
+- Backwards-compatible: `analysis` field is optional in JSON decode
+
+### Tags
+
+- New analysis emoji tags: ✅, ❌, ⭕, ⭕⭕, ⭕⭕⭕
+- Tags cleaned (stripped and re-added) alongside existing star tags and `death_after_therapy`
+- Existing minimum-star-rating tag behaviour unchanged
+
+### Auto-generated Notes
+
+- Decision analysis summary section added to the HTML note (category, tag, star total, inclusion/exclusion counts)
+- Appears between the disclaimer and per-model appraisal sections
+
+### Bug Fixes
+
+- Source collection fetch now uses `/items/top` instead of `/items` — PDF attachments and other child items no longer get sent to AI models for classification (they were just confusing the poor things)
+- Pre-classified articles (already screened by all models) now trigger analysis computation when encountered in the source collection — no more silent removal without scoring
+- Migration mode (`--migrate`) now computes analysis for articles that have all enabled model appraisals, adds analysis tags and sorts into analysis collections
+
+### Tests
+
+- New `AnalysisTest.elm` with 20 tests covering:
+  - All category boundary conditions (auto-excluded, human review, auto-included)
+  - The 5-star edge case (≤5 stars with <3 exclusions → human review)
+  - Tag generation for every exclusion count
+  - Collection name generation
+  - `isAnalysisTag` recognition
+  - JSON encode/decode roundtrip for all categories
+
 ## v0.3.0 — The Model Parliament
 
 The one where we stopped assuming Claude is the only game in town and let multiple AI models screen articles side by side. Democracy in action, or at least a vigorous peer review.

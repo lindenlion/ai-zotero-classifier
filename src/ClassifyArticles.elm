@@ -1,5 +1,6 @@
 module ClassifyArticles exposing (run)
 
+import Analysis
 import AnthropicApi
 import Appraisal
 import BackendTask exposing (BackendTask)
@@ -105,6 +106,16 @@ modelRelevantCollection m =
 modelIrrelevantCollection : ModelConfig -> String
 modelIrrelevantCollection m =
     capitalize m.key ++ " excluded"
+
+
+analysisAutoIncludedCollection : String
+analysisAutoIncludedCollection =
+    "AI auto-included"
+
+
+analysisAutoExcludedCollection : String
+analysisAutoExcludedCollection =
+    "AI auto-excluded"
 
 
 capitalize : String -> String
@@ -640,6 +651,9 @@ type alias Collections =
     , modelCollections : List ModelCollectionKeys
     , currentVersionKey : String
     , versionKeys : Dict Int String
+    , analysisAutoIncludedKey : String
+    , analysisAutoExcludedKey : String
+    , analysisStarSumKeys : Dict Int String
     }
 
 
@@ -733,8 +747,12 @@ resolveAllCollections config =
             (\allCollections ->
                 -- Check for duplicate collection names among collections we need
                 let
+                    starSumNames =
+                        List.range 5 12 |> List.map (\n -> "Sum of " ++ String.fromInt n ++ " stars")
+
                     neededNames =
-                        [ config.sourceCollection, migrationParentCollection ]
+                        [ config.sourceCollection, migrationParentCollection, analysisAutoIncludedCollection, analysisAutoExcludedCollection ]
+                            ++ starSumNames
                             ++ List.concatMap (\m -> [ modelRelevantCollection m, modelIrrelevantCollection m ]) config.models
                 in
                 case findDuplicateCollections neededNames allCollections of
@@ -746,13 +764,20 @@ resolveAllCollections config =
                             |> BackendTask.andThen
                                 (\( sourceKey, modelColls ) ->
                                     resolveVersionCollections config allCollections
-                                        |> BackendTask.map
+                                        |> BackendTask.andThen
                                             (\( currentKey, vKeys ) ->
-                                                { sourceKey = sourceKey
-                                                , modelCollections = modelColls
-                                                , currentVersionKey = currentKey
-                                                , versionKeys = vKeys
-                                                }
+                                                resolveAnalysisCollections config allCollections
+                                                    |> BackendTask.map
+                                                        (\analysisCols ->
+                                                            { sourceKey = sourceKey
+                                                            , modelCollections = modelColls
+                                                            , currentVersionKey = currentKey
+                                                            , versionKeys = vKeys
+                                                            , analysisAutoIncludedKey = analysisCols.autoIncludedKey
+                                                            , analysisAutoExcludedKey = analysisCols.autoExcludedKey
+                                                            , analysisStarSumKeys = analysisCols.starSumKeys
+                                                            }
+                                                        )
                                             )
                                 )
             )
@@ -872,6 +897,45 @@ resolveVersionCollections config allCollections =
             )
 
 
+{-| Resolve the two fixed analysis collections and all "Sum of N stars" collections.
+Star sums 5-15 cover every possible human review bucket.
+-}
+resolveAnalysisCollections : Config -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError { autoIncludedKey : String, autoExcludedKey : String, starSumKeys : Dict Int String }
+resolveAnalysisCollections config allCollections =
+    BackendTask.map2 Tuple.pair
+        (ensureCollection config analysisAutoIncludedCollection allCollections)
+        (ensureCollection config analysisAutoExcludedCollection allCollections)
+        |> BackendTask.andThen
+            (\( autoInclKey, autoExclKey ) ->
+                resolveStarSumCollections config allCollections (List.range 5 12) Dict.empty
+                    |> BackendTask.map
+                        (\starSumKeys ->
+                            { autoIncludedKey = autoInclKey
+                            , autoExcludedKey = autoExclKey
+                            , starSumKeys = starSumKeys
+                            }
+                        )
+            )
+
+
+resolveStarSumCollections : Config -> List ZoteroApi.ZoteroCollection -> List Int -> Dict Int String -> BackendTask FatalError (Dict Int String)
+resolveStarSumCollections config allCollections remaining acc =
+    case remaining of
+        [] ->
+            BackendTask.succeed acc
+
+        n :: rest ->
+            let
+                name =
+                    "Sum of " ++ String.fromInt n ++ " stars"
+            in
+            ensureCollection config name allCollections
+                |> BackendTask.andThen
+                    (\key ->
+                        resolveStarSumCollections config allCollections rest (Dict.insert n key acc)
+                    )
+
+
 ensureCollection : Config -> String -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError String
 ensureCollection config name allCollections =
     case allCollections |> List.filter (\c -> c.name == name) |> List.head |> Maybe.map .key of
@@ -959,11 +1023,10 @@ fetchFromSourceCollection config collections limit =
             zoteroBaseUrl config.zoteroLibraryId
                 ++ "/collections/"
                 ++ collections.sourceKey
-                ++ "/items?limit="
+                ++ "/items/top?limit="
                 ++ String.fromInt (min 100 limit)
-                ++ "&itemType=-note"
     in
-    Script.log ("GET /collections/" ++ collections.sourceKey ++ "/items (source)")
+    Script.log ("GET /collections/" ++ collections.sourceKey ++ "/items/top (source)")
         |> BackendTask.andThen
             (\_ ->
                 BackendTask.Http.request
@@ -1309,7 +1372,7 @@ updateItem config collections item modelResults allSucceeded =
                                 Appraisal.empty
 
                     -- Insert all model appraisals
-                    appraisalData =
+                    appraisalDataWithoutAnalysis =
                         List.foldl
                             (\( key, result ) acc ->
                                 let
@@ -1322,6 +1385,31 @@ updateItem config collections item modelResults allSucceeded =
                             )
                             baseAppraisalData
                             modelResults
+
+                    -- Compute analysis if all enabled models have appraisals
+                    enabledModelKeys =
+                        config.models
+                            |> List.filter .enabled
+                            |> List.map .key
+                            |> Set.fromList
+
+                    existingAppraisalKeys =
+                        appraisalDataWithoutAnalysis.appraisals
+                            |> Dict.keys
+                            |> Set.fromList
+
+                    allModelsComplete =
+                        Set.diff enabledModelKeys existingAppraisalKeys |> Set.isEmpty
+
+                    analysis =
+                        if allModelsComplete && not (Set.isEmpty enabledModelKeys) then
+                            Just (Analysis.compute appraisalDataWithoutAnalysis.appraisals)
+
+                        else
+                            Nothing
+
+                    appraisalData =
+                        { appraisalDataWithoutAnalysis | analysis = analysis }
 
                     callNumberJson =
                         Appraisal.encode appraisalData
@@ -1355,24 +1443,30 @@ updateItem config collections item modelResults allSucceeded =
                                             )
                                 )
 
-                    -- Clean tags: remove star tags and death_after_therapy (we'll re-add the right ones)
+                    -- Clean tags: remove star tags, death_after_therapy, and analysis tags (we'll re-add the right ones)
                     cleanedTags =
                         item.data.tags
                             |> List.filter
                                 (\t ->
                                     not (Classification.isStarTag t.tag)
+                                        && not (Analysis.isAnalysisTag t.tag)
                                         && t.tag
                                         /= "death_after_therapy"
                                 )
 
+                    analysisTag =
+                        analysis
+                            |> Maybe.map (\a -> [ { tag = Analysis.categoryToTag a } ])
+                            |> Maybe.withDefault []
+
                     newTags =
                         cleanedTags
-                            ++ ( case starRelevance of 
-                                Just stars ->
-                                    [ { tag = Classification.relevanceToEmoji stars } ]
+                            ++ (case starRelevance of
+                                    Just stars ->
+                                        [ { tag = Classification.relevanceToEmoji stars } ]
 
-                                Nothing ->
-                                    []
+                                    Nothing ->
+                                        []
                                )
                             ++ (if hasDeath then
                                     [ { tag = "death_after_therapy" } ]
@@ -1380,14 +1474,24 @@ updateItem config collections item modelResults allSucceeded =
                                 else
                                     []
                                )
+                            ++ analysisTag
 
                     -- Collections: add per-model targets + version, remove source if all succeeded
                     allVersionKeys =
                         Dict.values collections.versionKeys
 
+                    -- Also strip any existing analysis collection keys before re-adding
+                    allAnalysisCollectionKeys =
+                        [ collections.analysisAutoIncludedKey, collections.analysisAutoExcludedKey ]
+                            ++ Dict.values collections.analysisStarSumKeys
+
                     baseCollections =
                         item.data.collections
-                            |> List.filter (\c -> not (List.member c allVersionKeys))
+                            |> List.filter
+                                (\c ->
+                                    not (List.member c allVersionKeys)
+                                        && not (List.member c allAnalysisCollectionKeys)
+                                )
 
                     collectionsWithoutSource =
                         if allSucceeded then
@@ -1396,10 +1500,28 @@ updateItem config collections item modelResults allSucceeded =
                         else
                             baseCollections
 
+                    analysisCollectionKey =
+                        analysis
+                            |> Maybe.andThen
+                                (\a ->
+                                    case a.category of
+                                        Analysis.AutoIncluded ->
+                                            Just collections.analysisAutoIncludedKey
+
+                                        Analysis.AutoExcluded ->
+                                            Just collections.analysisAutoExcludedKey
+
+                                        Analysis.HumanReview ->
+                                            Dict.get a.totalStars collections.analysisStarSumKeys
+                                )
+                            |> Maybe.map List.singleton
+                            |> Maybe.withDefault []
+
                     newCollections =
                         (collectionsWithoutSource
                             ++ perModelCollectionKeys
                             ++ [ collections.currentVersionKey ]
+                            ++ analysisCollectionKey
                         )
                             |> dedup
 
@@ -1572,8 +1694,33 @@ prepareMigrateItem config collections item =
                     reasoningNoteHtml =
                         reasoningNotes |> List.head |> Maybe.map .note
 
-                    appraisalData =
+                    baseAppraisalData =
                         resolveAppraisalDataWithNotes item reasoningNoteHtml
+
+                    -- Compute analysis if all enabled models have appraisals
+                    enabledModelKeys =
+                        config.models
+                            |> List.filter .enabled
+                            |> List.map .key
+                            |> Set.fromList
+
+                    existingAppraisalKeys =
+                        baseAppraisalData.appraisals
+                            |> Dict.keys
+                            |> Set.fromList
+
+                    allModelsComplete =
+                        Set.diff enabledModelKeys existingAppraisalKeys |> Set.isEmpty
+
+                    analysis =
+                        if allModelsComplete && not (Set.isEmpty enabledModelKeys) then
+                            Just (Analysis.compute baseAppraisalData.appraisals)
+
+                        else
+                            Nothing
+
+                    appraisalData =
+                        { baseAppraisalData | analysis = analysis }
 
                     callNumberJson =
                         Appraisal.encode appraisalData
@@ -1582,19 +1729,60 @@ prepareMigrateItem config collections item =
                     allVersionKeys =
                         Dict.values collections.versionKeys
 
-                    collectionsWithoutOldVersions =
+                    allAnalysisCollectionKeys =
+                        [ collections.analysisAutoIncludedKey, collections.analysisAutoExcludedKey ]
+                            ++ Dict.values collections.analysisStarSumKeys
+
+                    collectionsWithoutOldVersionsOrAnalysis =
                         item.data.collections
-                            |> List.filter (\c -> not (List.member c allVersionKeys))
+                            |> List.filter
+                                (\c ->
+                                    not (List.member c allVersionKeys)
+                                        && not (List.member c allAnalysisCollectionKeys)
+                                )
+
+                    analysisCollectionKey =
+                        analysis
+                            |> Maybe.andThen
+                                (\a ->
+                                    case a.category of
+                                        Analysis.AutoIncluded ->
+                                            Just collections.analysisAutoIncludedKey
+
+                                        Analysis.AutoExcluded ->
+                                            Just collections.analysisAutoExcludedKey
+
+                                        Analysis.HumanReview ->
+                                            Dict.get a.totalStars collections.analysisStarSumKeys
+                                )
+                            |> Maybe.map List.singleton
+                            |> Maybe.withDefault []
 
                     newCollections =
-                        (collectionsWithoutOldVersions ++ [ collections.currentVersionKey ])
+                        (collectionsWithoutOldVersionsOrAnalysis
+                            ++ [ collections.currentVersionKey ]
+                            ++ analysisCollectionKey
+                        )
                             |> dedup
+
+                    -- Clean and rebuild tags with analysis tag
+                    cleanedTags =
+                        item.data.tags
+                            |> List.filter (\t -> not (Analysis.isAnalysisTag t.tag))
+
+                    analysisTag =
+                        analysis
+                            |> Maybe.map (\a -> [ { tag = Analysis.categoryToTag a } ])
+                            |> Maybe.withDefault []
+
+                    newTags =
+                        cleanedTags ++ analysisTag
                 in
                 BackendTask.succeed
                     (Ok
                         { itemKey = item.key
                         , itemVersion = item.version
-                        , tags = item.data.tags
+                        , tags = newTags
                         , collections = newCollections
                         , callNumber = callNumberJson
                         , noteHtml = Appraisal.generateNoteHtml appraisalData
@@ -1940,26 +2128,12 @@ processArticle config runConfig collections item stats =
             applicableModels |> List.map .key |> String.join ", "
     in
     if List.isEmpty applicableModels then
-        -- All selected models have already screened this item — clean up by removing from source
-        Script.log "  → Already screened by all selected models, removing from source"
+        -- All selected models have already screened this item — run analysis + migrate schema, then remove from source
+        Script.log "  → Already screened by all selected models, updating analysis and removing from source"
             |> BackendTask.andThen
                 (\_ ->
-                    let
-                        newCollections =
-                            item.data.collections
-                                |> List.filter (\c -> c /= collections.sourceKey)
-                    in
-                    if newCollections /= item.data.collections then
-                        patchItem config
-                            item
-                            { tags = item.data.tags
-                            , collections = newCollections
-                            , callNumber = item.data.callNumber
-                            }
-                            |> BackendTask.map (\_ -> ( stats, Continue ))
-
-                    else
-                        BackendTask.succeed ( stats, Continue )
+                    updateItem config collections item [] True
+                        |> BackendTask.map (\_ -> ( stats, Continue ))
                 )
 
     else
