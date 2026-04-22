@@ -1539,8 +1539,7 @@ updateItem config collections item modelResults allSucceeded =
                     newCollections =
                         (collectionsWithoutSource
                             ++ perModelCollectionKeys
-                            ++ [ collections.currentVersionKey ]
-                            ++ analysisCollectionKey
+                            ++ ( collections.currentVersionKey :: analysisCollectionKey )
                         )
                             |> dedup
 
@@ -1658,7 +1657,7 @@ fetchItemsFromCollections config collectionKeys limit acc =
                     zoteroBaseUrl config.zoteroLibraryId
                         ++ "/collections/"
                         ++ key
-                        ++ "/items?limit="
+                        ++ "/items/top?limit="
                         ++ String.fromInt (min 100 remaining)
                         ++ "&itemType=-note"
             in
@@ -1779,8 +1778,7 @@ prepareMigrateItem config collections item =
 
                     newCollections =
                         (collectionsWithoutOldVersionsOrAnalysis
-                            ++ [ collections.currentVersionKey ]
-                            ++ analysisCollectionKey
+                            ++ ( collections.currentVersionKey :: analysisCollectionKey )
                         )
                             |> dedup
 

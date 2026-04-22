@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1 — Escape from the never-ending migration loop
+
+### Bug fix
+
+- added /top to the article fetch query for the migration path, to prevent looping through child item attachments.
+
+
 ## v0.4.0 — The Triage Tribunal
 
 The one where three AI models stop just filing opinions and start actually reaching a verdict. Every article now gets a score, a category, and a collection — no more squinting at individual appraisals wondering what it all means.
