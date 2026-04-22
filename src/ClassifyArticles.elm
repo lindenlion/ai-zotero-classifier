@@ -723,13 +723,15 @@ andThenResult f task =
             )
 
 
-resolveAllCollections : Config -> BackendTask FatalError Collections
-resolveAllCollections config =
+{-| Fetch all collections from Zotero, paginating through 100 at a time.
+-}
+fetchAllCollections : Config -> Int -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError (List ZoteroApi.ZoteroCollection)
+fetchAllCollections config start acc =
     let
         url =
-            zoteroBaseUrl config.zoteroLibraryId ++ "/collections"
+            zoteroBaseUrl config.zoteroLibraryId ++ "/collections?limit=100&start=" ++ String.fromInt start
     in
-    Script.log "GET /collections"
+    Script.log ("GET /collections?limit=100&start=" ++ String.fromInt start)
         |> BackendTask.andThen
             (\_ ->
                 BackendTask.Http.request
@@ -743,6 +745,23 @@ resolveAllCollections config =
                     (BackendTask.Http.expectJson ZoteroApi.collectionListDecoder)
                     |> BackendTask.allowFatal
             )
+        |> BackendTask.andThen
+            (\batch ->
+                let
+                    all =
+                        acc ++ batch
+                in
+                if List.length batch < 100 then
+                    BackendTask.succeed all
+
+                else
+                    fetchAllCollections config (start + 100) all
+            )
+
+
+resolveAllCollections : Config -> BackendTask FatalError Collections
+resolveAllCollections config =
+    fetchAllCollections config 0 []
         |> BackendTask.andThen
             (\allCollections ->
                 -- Check for duplicate collection names among collections we need

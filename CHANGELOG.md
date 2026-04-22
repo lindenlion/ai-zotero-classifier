@@ -50,6 +50,7 @@ The one where three AI models stop just filing opinions and start actually reach
 ### Bug Fixes
 
 - Source collection fetch now uses `/items/top` instead of `/items` — PDF attachments and other child items no longer get sent to AI models for classification (they were just confusing the poor things)
+- Collection fetch now paginates through all results (100 per page) instead of silently truncating — libraries with more than 100 collections no longer get duplicate collections created on every run
 - Pre-classified articles (already screened by all models) now trigger analysis computation when encountered in the source collection — no more silent removal without scoring
 - Migration mode (`--migrate`) now computes analysis for articles that have all enabled model appraisals, adds analysis tags and sorts into analysis collections
 
