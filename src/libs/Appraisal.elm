@@ -14,6 +14,7 @@ module Appraisal exposing
     , setAppraisal
     )
 
+import Analysis
 import Classification exposing (ClassificationResult, Decision(..))
 import Dict exposing (Dict)
 import Json.Decode as Decode exposing (Decoder)
@@ -24,6 +25,7 @@ type alias AppraisalData =
     { version : Int
     , appraisals : Dict String ProviderAppraisal
     , asreview : Maybe ASReviewData
+    , analysis : Maybe Analysis.AnalysisData
     }
 
 
@@ -51,7 +53,7 @@ type alias ASReviewData =
 
 currentSchemaVersion : Int
 currentSchemaVersion =
-    1
+    2
 
 
 empty : AppraisalData
@@ -59,6 +61,7 @@ empty =
     { version = currentSchemaVersion
     , appraisals = Dict.empty
     , asreview = Nothing
+    , analysis = Nothing
     }
 
 
@@ -68,7 +71,6 @@ needsMigration data =
 
 
 {-| Upgrade AppraisalData from any older version to current.
-Currently a no-op (only v1 exists). Add migration steps here as schema evolves.
 -}
 migrateToCurrentVersion : AppraisalData -> AppraisalData
 migrateToCurrentVersion data =
@@ -76,9 +78,13 @@ migrateToCurrentVersion data =
         data
 
     else
-        -- Future: chain version upgrades here, e.g.:
-        -- data |> migrateV1toV2 |> migrateV2toV3
-        { data | version = currentSchemaVersion }
+        data
+            |> migrateV1toV2
+
+
+migrateV1toV2 : AppraisalData -> AppraisalData
+migrateV1toV2 data =
+    { data | version = 2, analysis = Nothing }
 
 
 
@@ -94,6 +100,13 @@ encode data =
             ++ (case data.asreview of
                     Just asr ->
                         [ ( "asreview", encodeASReviewData asr ) ]
+
+                    Nothing ->
+                        []
+               )
+            ++ (case data.analysis of
+                    Just analysis ->
+                        [ ( "analysis", Analysis.encode analysis ) ]
 
                     Nothing ->
                         []
@@ -129,10 +142,11 @@ encodeASReviewData asr =
 
 decode : Decoder AppraisalData
 decode =
-    Decode.map3 AppraisalData
+    Decode.map4 AppraisalData
         (Decode.field "v" Decode.int)
         (Decode.field "appraisals" (Decode.dict providerAppraisalDecoder))
         (Decode.maybe (Decode.field "asreview" asReviewDataDecoder))
+        (Decode.maybe (Decode.field "analysis" Analysis.decode))
 
 
 providerAppraisalDecoder : Decoder ProviderAppraisal
@@ -204,6 +218,14 @@ generateNoteHtml data =
         disclaimer =
             "<p><em>This note is auto-generated from structured data in the Call Number field. Do not edit manually.</em></p>"
 
+        analysisSection =
+            case data.analysis of
+                Just analysis ->
+                    analysisToHtml analysis
+
+                Nothing ->
+                    ""
+
         providerSections =
             data.appraisals
                 |> Dict.toList
@@ -218,7 +240,39 @@ generateNoteHtml data =
                 Nothing ->
                     ""
     in
-    disclaimer ++ "<hr/>" ++ providerSections ++ asreviewSection
+    disclaimer ++ analysisSection ++ "<hr/>" ++ providerSections ++ asreviewSection
+
+
+analysisToHtml : Analysis.AnalysisData -> String
+analysisToHtml analysis =
+    let
+        categoryLabel =
+            case analysis.category of
+                Analysis.AutoExcluded ->
+                    "Auto-excluded"
+
+                Analysis.HumanReview ->
+                    "Human review"
+
+                Analysis.AutoIncluded ->
+                    "Auto-included"
+
+        tag =
+            Analysis.categoryToTag analysis
+    in
+    "<hr/><h3>Decision Analysis</h3>"
+        ++ "<p><strong>Category:</strong> "
+        ++ categoryLabel
+        ++ " "
+        ++ tag
+        ++ "</p>"
+        ++ "<p>Total stars: "
+        ++ String.fromInt analysis.totalStars
+        ++ " | Inclusions: "
+        ++ String.fromInt analysis.inclusions
+        ++ " | Exclusions: "
+        ++ String.fromInt analysis.exclusions
+        ++ "</p>"
 
 
 providerToHtml : ( String, ProviderAppraisal ) -> String
@@ -359,7 +413,7 @@ migrateFromLegacy { tags, reasoningNoteHtml } =
                 , timestamp = "31 March 2026"
                 }
         in
-        Just { version = 1, appraisals = Dict.singleton "claude" appraisal, asreview = Nothing }
+        Just { version = 2, appraisals = Dict.singleton "claude" appraisal, asreview = Nothing, analysis = Nothing }
 
     else
         Nothing

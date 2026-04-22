@@ -7,7 +7,8 @@ Automated classification of PubMed articles for IEI (Inborn Errors of Immunity) 
 ```
 src/ClassifyArticles.elm          Main script (CLI, API orchestration, migration)
 src/libs/
-  Appraisal.elm                   Structured appraisal schema, encode/decode, note generation
+  Analysis.elm                    Decision analysis: aggregate scoring, categories, tags, collections
+  Appraisal.elm                   Structured appraisal schema (v2), encode/decode, note generation
   Classification.elm              Relevance types, decision logic, JSON decoders
   ZoteroApi.elm                   Zotero item/collection types, JSON codecs, article extraction
   AnthropicApi.elm                Anthropic Messages API types, request encoder, response decoder
