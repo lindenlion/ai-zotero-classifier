@@ -51,6 +51,7 @@ type alias ZoteroCollection =
     { key : String
     , name : String
     , parentCollection : String
+    , deleted : Bool
     }
 
 
@@ -150,7 +151,7 @@ noteListDecoder =
 
 collectionDecoder : Decoder ZoteroCollection
 collectionDecoder =
-    Decode.map3 ZoteroCollection
+    Decode.map4 ZoteroCollection
         (Decode.field "key" Decode.string)
         (Decode.at [ "data", "name" ] Decode.string)
         (Decode.at [ "data", "parentCollection" ]
@@ -161,6 +162,15 @@ collectionDecoder =
             )
             |> Decode.maybe
             |> Decode.map (Maybe.withDefault "")
+        )
+        (Decode.at [ "data", "deleted" ]
+            (Decode.oneOf
+                [ Decode.bool
+                , Decode.int |> Decode.map (\n -> n /= 0)
+                ]
+            )
+            |> Decode.maybe
+            |> Decode.map (Maybe.withDefault False)
         )
 
 

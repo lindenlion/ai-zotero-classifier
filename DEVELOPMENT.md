@@ -65,6 +65,8 @@ npm run classify -- --models claude # run only Claude (comma-separated for multi
 npm run classify -- --reprocess deepseek      # force re-run DeepSeek, overwriting existing appraisals
 npm run classify -- --migrate       # migrate all legacy articles (no AI calls)
 npm run classify -- --migrate 0     # migrate from version 0 (legacy)
+npm run classify -- --random-sample 100             # create "Random 100" collection with 100 random articles
+npm run classify -- --random-sample 50 --from KEY   # draw 50 random articles from a specific collection
 npm run test                        # run all tests (elm-test-rs)
 npm run review                      # run elm-review
 npm run review:fix                  # auto-fix elm-review errors
@@ -77,6 +79,8 @@ npm run build                       # bundle optimized script to ./build/
 - `--max` can be combined with any flag
 - `--models` and `--reprocess` cannot be combined (fatal error with explanation)
 - `--migrate` cannot be combined with `--models` or `--reprocess`
+- `--random-sample` cannot be combined with `--models`, `--reprocess`, or `--migrate`
+- `--from` can only be used with `--random-sample`
 
 ## Links
 

@@ -107,7 +107,7 @@ suite =
                             """{"key": "COL1", "data": {"name": "Claude included"}}"""
                     in
                     Decode.decodeString ZoteroApi.collectionDecoder json
-                        |> Expect.equal (Ok { key = "COL1", name = "Claude included", parentCollection = "" })
+                        |> Expect.equal (Ok { key = "COL1", name = "Claude included", parentCollection = "", deleted = False })
             , test "decodes a collection with parentCollection string" <|
                 \_ ->
                     let
@@ -115,7 +115,7 @@ suite =
                             """{"key": "SUB1", "data": {"name": "version_1", "parentCollection": "PARENT_KEY"}}"""
                     in
                     Decode.decodeString ZoteroApi.collectionDecoder json
-                        |> Expect.equal (Ok { key = "SUB1", name = "version_1", parentCollection = "PARENT_KEY" })
+                        |> Expect.equal (Ok { key = "SUB1", name = "version_1", parentCollection = "PARENT_KEY", deleted = False })
             , test "decodes a collection with parentCollection false (top-level)" <|
                 \_ ->
                     let
@@ -123,7 +123,15 @@ suite =
                             """{"key": "TOP1", "data": {"name": "Top level", "parentCollection": false}}"""
                     in
                     Decode.decodeString ZoteroApi.collectionDecoder json
-                        |> Expect.equal (Ok { key = "TOP1", name = "Top level", parentCollection = "" })
+                        |> Expect.equal (Ok { key = "TOP1", name = "Top level", parentCollection = "", deleted = False })
+            , test "decodes a deleted collection" <|
+                \_ ->
+                    let
+                        json =
+                            """{"key": "DEL1", "data": {"name": "Trashed", "deleted": 1}}"""
+                    in
+                    Decode.decodeString ZoteroApi.collectionDecoder json
+                        |> Expect.equal (Ok { key = "DEL1", name = "Trashed", parentCollection = "", deleted = True })
             ]
         , describe "collectionListDecoder"
             [ test "decodes list of collections" <|

@@ -19,7 +19,8 @@ import Json.Decode as Decode
 import Json.Encode as Encode
 import OpenAiApi
 import Pages.Script as Script exposing (Script)
-import Set
+import Random
+import Set exposing (Set)
 import Stats exposing (CircuitBreakerAction(..), Stats, emptyStats)
 import Time
 import ZoteroApi
@@ -137,6 +138,8 @@ type alias CliOptions =
     , reprocess : Maybe String
     , max : Maybe String
     , migrate : Maybe String
+    , randomSample : Maybe String
+    , from : Maybe String
     }
 
 
@@ -161,6 +164,14 @@ program =
                     (Option.optionalKeywordArg "migrate"
                         |> Option.withDescription "Migration-only mode (no AI calls). Optional integer = oldest schema version to migrate from. Can only be combined with --max. "
                     )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "random-sample"
+                        |> Option.withDescription "Create a random sample collection. Value = number of articles. Excludes articles already in any collection with 'Random' or 'random' in the name. Cannot be combined with other options except --from."
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "from"
+                        |> Option.withDescription "Zotero collection key to draw articles from (used with --random-sample). Without this, draws from the entire library."
+                    )
             )
 
 
@@ -172,16 +183,39 @@ run : Script
 run =
     Script.withCliOptions program
         (\options ->
-            loadConfig
-                |> BackendTask.andThen
-                    (\config ->
-                        resolveRunConfig config options
+            case options.randomSample of
+                Just sampleRaw ->
+                    -- Random sampling mode: cannot combine with other flags (except --from)
+                    if options.models /= Nothing || options.reprocess /= Nothing || options.migrate /= Nothing then
+                        BackendTask.fail (FatalError.fromString "--random-sample cannot be combined with --models, --reprocess, or --migrate.")
+
+                    else
+                        loadConfigJson
                             |> BackendTask.andThen
-                                (\runConfig ->
-                                    logBanner options runConfig
-                                        |> BackendTask.andThen (\_ -> initAndProcess config runConfig options)
+                                (\cfg ->
+                                    resolveZoteroApiKey
+                                        |> BackendTask.andThen
+                                            (\apiKey ->
+                                                parseBatchSize sampleRaw
+                                                    |> BackendTask.andThen (runBatchSample cfg.zoteroLibraryId apiKey options.from)
+                                            )
                                 )
-                    )
+
+                Nothing ->
+                    if options.from /= Nothing then
+                        BackendTask.fail (FatalError.fromString "--from can only be used with --random-sample.")
+
+                    else
+                        loadConfig
+                            |> BackendTask.andThen
+                                (\config ->
+                                    resolveRunConfig config options
+                                        |> BackendTask.andThen
+                                            (\runConfig ->
+                                                logBanner options runConfig
+                                                    |> BackendTask.andThen (\_ -> initAndProcess config runConfig options)
+                                            )
+                            )
         )
 
 
@@ -724,6 +758,8 @@ andThenResult f task =
 
 
 {-| Fetch all collections from Zotero, paginating through 100 at a time.
+Trashed collections (deleted=true) are filtered out — ghosts of collections past
+have no business haunting the living.
 -}
 fetchAllCollections : Config -> Int -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError (List ZoteroApi.ZoteroCollection)
 fetchAllCollections config start acc =
@@ -748,8 +784,11 @@ fetchAllCollections config start acc =
         |> BackendTask.andThen
             (\batch ->
                 let
+                    liveBatch =
+                        List.filter (\c -> not c.deleted) batch
+
                     all =
-                        acc ++ batch
+                        acc ++ liveBatch
                 in
                 if List.length batch < 100 then
                     BackendTask.succeed all
@@ -2403,3 +2442,426 @@ handleArticleError errMsg stats =
 printFinalSummary : Stats -> BackendTask FatalError ()
 printFinalSummary stats =
     Script.log (Stats.formatSummary "FINAL SUMMARY" stats)
+
+
+
+-- Batch random sampling
+
+
+{-| Parse and validate the --batch value.
+-}
+parseBatchSize : String -> BackendTask FatalError Int
+parseBatchSize raw =
+    case String.toInt (String.trim raw) of
+        Just n ->
+            if n > 0 then
+                BackendTask.succeed n
+
+            else
+                BackendTask.fail (FatalError.fromString ("Invalid --batch value: " ++ raw ++ ". Must be a positive integer."))
+
+        Nothing ->
+            BackendTask.fail (FatalError.fromString ("Invalid --batch value: " ++ raw ++ ". Must be a positive integer."))
+
+
+{-| Main entry point for random sampling.
+
+Fetches item keys (from a specific collection via --from, or the whole library),
+finds existing "Random" collections, subtracts their members, shuffles the remainder,
+and creates a new collection with N items.
+Uses BackendTask.Time.now as a seed for pure Random.step — no Cmd needed!
+-}
+runBatchSample : String -> String -> Maybe String -> Int -> BackendTask FatalError ()
+runBatchSample libraryId apiKey maybeFromCollection batchSize =
+    let
+        sourceLabel =
+            case maybeFromCollection of
+                Just fromKey ->
+                    "from collection " ++ fromKey
+
+                Nothing ->
+                    "from entire library"
+    in
+    Script.log ("🎲 Random Sampling\n" ++ String.repeat 60 "=" ++ "\nRequested sample size: " ++ String.fromInt batchSize ++ " (" ++ sourceLabel ++ ")")
+        |> BackendTask.andThen
+            (\_ ->
+                fetchAllCollections { zoteroLibraryId = libraryId, zoteroApiKey = apiKey, sourceCollection = "", systemPrompt = "", models = [] } 0 []
+            )
+        |> BackendTask.andThen
+            (\allCollections ->
+                let
+                    randomCollections =
+                        allCollections
+                            |> List.filter (\c -> String.contains "random" (String.toLower c.name))
+
+                    randomCollectionNames =
+                        randomCollections |> List.map .name |> String.join ", "
+                in
+                -- Validate --from collection key exists (if provided)
+                (case maybeFromCollection of
+                    Just fromKey ->
+                        case allCollections |> List.filter (\c -> c.key == fromKey) |> List.head of
+                            Just coll ->
+                                Script.log ("✓ Source collection: " ++ coll.name ++ " (" ++ fromKey ++ ")")
+
+                            Nothing ->
+                                BackendTask.fail
+                                    (FatalError.fromString
+                                        ("Collection key \"" ++ fromKey ++ "\" not found in Zotero. Check the key and try again.")
+                                    )
+
+                    Nothing ->
+                        Script.log "✓ Drawing from entire library"
+                )
+                    |> BackendTask.andThen
+                        (\_ ->
+                            Script.log
+                                ("✓ Found "
+                                    ++ String.fromInt (List.length randomCollections)
+                                    ++ " existing Random collection(s)"
+                                    ++ (if List.isEmpty randomCollections then
+                                            ""
+
+                                        else
+                                            ": " ++ randomCollectionNames
+                                       )
+                                )
+                        )
+                    |> BackendTask.andThen
+                        (\_ ->
+                            -- Fetch candidate item keys and exclusion keys in parallel
+                            BackendTask.map2 Tuple.pair
+                                (fetchCandidateVersions libraryId apiKey maybeFromCollection)
+                                (fetchExclusionKeys libraryId apiKey randomCollections)
+                        )
+                    |> BackendTask.andThen
+                        (\( candidateVersions, excludeKeys ) ->
+                            let
+                                candidateKeys =
+                                    Dict.keys candidateVersions
+
+                                available =
+                                    candidateKeys |> List.filter (\k -> not (Set.member k excludeKeys))
+
+                                availableCount =
+                                    List.length available
+                            in
+                            Script.log
+                                ("✓ "
+                                    ++ String.fromInt (List.length candidateKeys)
+                                    ++ " candidate items"
+                                    ++ (case maybeFromCollection of
+                                            Just _ ->
+                                                " in source collection"
+
+                                            Nothing ->
+                                                " in library (excl. notes)"
+                                       )
+                                    ++ "\n✓ "
+                                    ++ String.fromInt (Set.size excludeKeys)
+                                    ++ " keys excluded (already in Random collections)\n✓ "
+                                    ++ String.fromInt availableCount
+                                    ++ " available for sampling"
+                                )
+                                |> BackendTask.andThen
+                                    (\_ ->
+                                        if availableCount < batchSize then
+                                            BackendTask.fail
+                                                (FatalError.fromString
+                                                    ("Not enough articles! Need "
+                                                        ++ String.fromInt batchSize
+                                                        ++ " but only "
+                                                        ++ String.fromInt availableCount
+                                                        ++ " available after excluding existing Random collections."
+                                                    )
+                                                )
+
+                                        else
+                                            BackendTask.Time.now
+                                                |> BackendTask.andThen
+                                                    (\now ->
+                                                        let
+                                                            seed =
+                                                                Random.initialSeed (Time.posixToMillis now)
+
+                                                            selected =
+                                                                shuffleAndTake seed batchSize available
+
+                                                            collectionName =
+                                                                findAvailableCollectionName
+                                                                    ("Random " ++ String.fromInt batchSize)
+                                                                    (allCollections |> List.map .name |> Set.fromList)
+                                                        in
+                                                        Script.log ("🎯 Selected " ++ String.fromInt batchSize ++ " random articles")
+                                                            |> BackendTask.andThen
+                                                                (\_ ->
+                                                                    createBatchCollection libraryId apiKey collectionName
+                                                                        |> BackendTask.andThen
+                                                                            (\collKey ->
+                                                                                addKeysToBatchCollection libraryId apiKey candidateVersions collKey selected
+                                                                            )
+                                                                )
+                                                            |> BackendTask.andThen
+                                                                (\_ ->
+                                                                    Script.log
+                                                                        ("\n✓ Done! Created collection \""
+                                                                            ++ collectionName
+                                                                            ++ "\" with "
+                                                                            ++ String.fromInt batchSize
+                                                                            ++ " random articles."
+                                                                            ++ "\n  (No overlap with existing Random collections — the universe remains orderly.)"
+                                                                        )
+                                                                )
+                                                    )
+                                    )
+                        )
+            )
+
+
+{-| Fetch candidate item versions — either from a specific collection or the whole library.
+-}
+fetchCandidateVersions : String -> String -> Maybe String -> BackendTask FatalError (Dict String Int)
+fetchCandidateVersions libraryId apiKey maybeFromCollection =
+    case maybeFromCollection of
+        Just collectionKey ->
+            fetchCollectionVersions libraryId apiKey collectionKey
+
+        Nothing ->
+            fetchAllItemVersions libraryId apiKey
+
+
+{-| Fetch all top-level item keys and versions (excluding notes) in one request.
+Zotero returns all results for format=versions without pagination.
+-}
+fetchAllItemVersions : String -> String -> BackendTask FatalError (Dict String Int)
+fetchAllItemVersions libraryId apiKey =
+    let
+        url =
+            zoteroBaseUrl libraryId ++ "/items/top?format=versions&itemType=-note"
+    in
+    Script.log "GET /items/top?format=versions&itemType=-note"
+        |> BackendTask.andThen
+            (\_ ->
+                BackendTask.Http.request
+                    { url = url
+                    , method = "GET"
+                    , headers = zoteroHeaders apiKey
+                    , body = BackendTask.Http.emptyBody
+                    , retries = Just 1
+                    , timeoutInMs = Just 60000
+                    }
+                    (BackendTask.Http.expectJson (Decode.dict Decode.int))
+                    |> BackendTask.allowFatal
+            )
+
+
+{-| Fetch item keys from a single collection using format=versions.
+-}
+fetchCollectionVersions : String -> String -> String -> BackendTask FatalError (Dict String Int)
+fetchCollectionVersions libraryId apiKey collectionKey =
+    let
+        url =
+            zoteroBaseUrl libraryId ++ "/collections/" ++ collectionKey ++ "/items/top?format=versions"
+    in
+    Script.log ("GET /collections/" ++ collectionKey ++ "/items/top?format=versions")
+        |> BackendTask.andThen
+            (\_ ->
+                BackendTask.Http.request
+                    { url = url
+                    , method = "GET"
+                    , headers = zoteroHeaders apiKey
+                    , body = BackendTask.Http.emptyBody
+                    , retries = Just 1
+                    , timeoutInMs = Just 30000
+                    }
+                    (BackendTask.Http.expectJson (Decode.dict Decode.int))
+                    |> BackendTask.allowFatal
+            )
+
+
+{-| Build a set of all item keys already in any Random collection.
+-}
+fetchExclusionKeys : String -> String -> List ZoteroApi.ZoteroCollection -> BackendTask FatalError (Set String)
+fetchExclusionKeys libraryId apiKey collections =
+    fetchExclusionKeysHelper libraryId apiKey collections Set.empty
+
+
+fetchExclusionKeysHelper : String -> String -> List ZoteroApi.ZoteroCollection -> Set String -> BackendTask FatalError (Set String)
+fetchExclusionKeysHelper libraryId apiKey collections acc =
+    case collections of
+        [] ->
+            BackendTask.succeed acc
+
+        coll :: rest ->
+            fetchCollectionVersions libraryId apiKey coll.key
+                |> BackendTask.andThen
+                    (\versions ->
+                        let
+                            newAcc =
+                                Dict.keys versions |> List.foldl Set.insert acc
+                        in
+                        fetchExclusionKeysHelper libraryId apiKey rest newAcc
+                    )
+
+
+{-| Shuffle a list and take the first n elements.
+Uses Random.step for a pure (no Cmd) shuffle seeded from BackendTask.Time.now.
+-}
+shuffleAndTake : Random.Seed -> Int -> List a -> List a
+shuffleAndTake seed n list =
+    let
+        len =
+            List.length list
+
+        ( randoms, _ ) =
+            Random.step (Random.list len (Random.float 0 1)) seed
+    in
+    List.map2 Tuple.pair randoms list
+        |> List.sortBy Tuple.first
+        |> List.map Tuple.second
+        |> List.take n
+
+
+{-| Find a collection name that doesn't clash with existing ones.
+Tries "Random N", then "Random N (2)", "Random N (3)", etc.
+-}
+findAvailableCollectionName : String -> Set String -> String
+findAvailableCollectionName baseName existingNames =
+    if not (Set.member baseName existingNames) then
+        baseName
+
+    else
+        findAvailableCollectionNameHelper baseName existingNames 2
+
+
+findAvailableCollectionNameHelper : String -> Set String -> Int -> String
+findAvailableCollectionNameHelper baseName existingNames n =
+    let
+        candidate =
+            baseName ++ " (" ++ String.fromInt n ++ ")"
+    in
+    if not (Set.member candidate existingNames) then
+        candidate
+
+    else
+        findAvailableCollectionNameHelper baseName existingNames (n + 1)
+
+
+{-| Create a top-level collection for the batch sample.
+-}
+createBatchCollection : String -> String -> String -> BackendTask FatalError String
+createBatchCollection libraryId apiKey name =
+    let
+        url =
+            zoteroBaseUrl libraryId ++ "/collections"
+    in
+    Script.log ("POST /collections (create: " ++ name ++ ")")
+        |> BackendTask.andThen
+            (\_ ->
+                BackendTask.Http.request
+                    { url = url
+                    , method = "POST"
+                    , headers = zoteroHeaders apiKey
+                    , body = BackendTask.Http.jsonBody (ZoteroApi.encodeCreateCollection name)
+                    , retries = Nothing
+                    , timeoutInMs = Just 30000
+                    }
+                    (BackendTask.Http.expectJson
+                        (Decode.at [ "successful", "0", "key" ] Decode.string)
+                    )
+                    |> BackendTask.allowFatal
+            )
+        |> BackendTask.andThen
+            (\key ->
+                Script.log ("✓ Created collection: " ++ name ++ " (" ++ key ++ ")")
+                    |> BackendTask.map (\_ -> key)
+            )
+
+
+{-| Fetch items by key, add them to the new collection, and batch-update.
+Processes in chunks of 50 (Zotero's itemKey parameter limit).
+-}
+addKeysToBatchCollection : String -> String -> Dict String Int -> String -> List String -> BackendTask FatalError ()
+addKeysToBatchCollection libraryId apiKey allVersions collectionKey selectedKeys =
+    let
+        chunks =
+            chunk 50 selectedKeys
+    in
+    addKeysToBatchCollectionHelper libraryId apiKey allVersions collectionKey chunks 1 (List.length chunks)
+
+
+addKeysToBatchCollectionHelper : String -> String -> Dict String Int -> String -> List (List String) -> Int -> Int -> BackendTask FatalError ()
+addKeysToBatchCollectionHelper libraryId apiKey allVersions collectionKey chunks idx total =
+    case chunks of
+        [] ->
+            BackendTask.succeed ()
+
+        keys :: rest ->
+            Script.log ("\n📤 Fetching + updating chunk " ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ " (" ++ String.fromInt (List.length keys) ++ " items)...")
+                |> BackendTask.andThen (\_ -> fetchItemsByKeys libraryId apiKey keys)
+                |> BackendTask.andThen
+                    (\items ->
+                        let
+                            patchBody =
+                                items
+                                    |> List.map
+                                        (\item ->
+                                            Encode.object
+                                                [ ( "key", Encode.string item.key )
+                                                , ( "version", Encode.int item.version )
+                                                , ( "collections"
+                                                  , Encode.list Encode.string
+                                                        (if List.member collectionKey item.data.collections then
+                                                            item.data.collections
+
+                                                         else
+                                                            collectionKey :: item.data.collections
+                                                        )
+                                                  )
+                                                ]
+                                        )
+                                    |> Encode.list identity
+                        in
+                        Script.log ("  → Adding " ++ String.fromInt (List.length items) ++ " items to collection...")
+                            |> BackendTask.andThen
+                                (\_ ->
+                                    BackendTask.Http.request
+                                        { url = zoteroBaseUrl libraryId ++ "/items"
+                                        , method = "POST"
+                                        , headers = zoteroHeaders apiKey
+                                        , body = BackendTask.Http.jsonBody patchBody
+                                        , retries = Just 1
+                                        , timeoutInMs = Just 30000
+                                        }
+                                        (BackendTask.Http.expectWhatever ())
+                                        |> BackendTask.allowFatal
+                                )
+                    )
+                |> BackendTask.andThen (\_ -> addKeysToBatchCollectionHelper libraryId apiKey allVersions collectionKey rest (idx + 1) total)
+
+
+{-| Fetch full item data for a list of keys (max 50 per Zotero API).
+-}
+fetchItemsByKeys : String -> String -> List String -> BackendTask FatalError (List ZoteroApi.ZoteroItem)
+fetchItemsByKeys libraryId apiKey keys =
+    let
+        keyParam =
+            String.join "," keys
+
+        url =
+            zoteroBaseUrl libraryId ++ "/items?itemKey=" ++ keyParam ++ "&format=json"
+    in
+    Script.log ("GET /items?itemKey=... (" ++ String.fromInt (List.length keys) ++ " keys)")
+        |> BackendTask.andThen
+            (\_ ->
+                BackendTask.Http.request
+                    { url = url
+                    , method = "GET"
+                    , headers = zoteroHeaders apiKey
+                    , body = BackendTask.Http.emptyBody
+                    , retries = Just 1
+                    , timeoutInMs = Just 30000
+                    }
+                    (BackendTask.Http.expectJson ZoteroApi.itemListDecoder)
+                    |> BackendTask.allowFatal
+            )

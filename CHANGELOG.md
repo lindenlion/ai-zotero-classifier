@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.5.0 — The "take a random handful and look closely" release
+
+### New `--random-sample` flag
+
+Create random, non-overlapping sample collections straight from the CLI:
+
+```bash
+# Draw 100 random articles from the entire library
+elm-pages run src/ClassifyArticles.elm --random-sample 100
+
+# Draw 50 from a specific collection (use Zotero collection key)
+elm-pages run src/ClassifyArticles.elm --random-sample 50 --from ABC12345
+```
+
+This creates a Zotero collection called "Random 100" (or "Random 50") with randomly selected articles. Run it again and you get "Random 100 (2)" — no overlap guaranteed.
+
+**How it works:**
+- With `--from`: draws only from items in that specific Zotero collection
+- Without `--from`: draws from all top-level items in the library (excluding notes), fetched via Zotero's `format=versions` endpoint — one request, no pagination needed
+- Finds all existing collections with "Random" or "random" in the name (e.g. "Random 100 (QC) Rayyan")
+- Fetches keys from each of those collections and builds an exclusion set
+- Shuffles the remaining pool using `Random.step` with a time-based seed (pure shuffle, no `Cmd` needed — take that, Elm Architecture!)
+- Creates a new collection and batch-adds the selected articles
+
+**Details:**
+- `elm/random` promoted from indirect to direct dependency
+- Auto-numbers collection names when duplicates exist: "Random 100" → "Random 100 (2)" → "Random 100 (3)"
+- `--from` validates the collection key exists before proceeding
+- Cannot be combined with `--models`, `--reprocess`, or `--migrate`; `--from` is only valid with `--random-sample`
+- Items fetched and updated in chunks of 50 (Zotero's batch limit)
+- Only needs Zotero credentials — no AI API keys required
+
+### Bug fix: trashed collections no longer haunt the living
+
+Collections in Zotero's trash were being treated as if they still existed. The collection decoder now parses the `deleted` field (handles both `bool` and `int` representations from the Zotero API), and `fetchAllCollections` filters out trashed collections. This affects all collection lookups — duplicate detection, source/model collection resolution, Random collection exclusion, and name availability checks.
+
 ## v0.4.3 - No more hidden surprises
 
 ### Cache hit logging
