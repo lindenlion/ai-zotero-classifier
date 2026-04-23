@@ -1172,7 +1172,16 @@ classifyWithAnthropic modelConfig systemPrompt userMessage =
         , timeoutInMs = Just 120000
         }
         (BackendTask.Http.expectJson AnthropicApi.messageResponseDecoder)
-        |> BackendTask.map (Result.andThen parseAnthropicResponse)
+        |> BackendTask.andThen
+            (\result ->
+                case result of
+                    Ok response ->
+                        logCacheUsage modelConfig.key (anthropicCacheLog response.usage)
+                            |> BackendTask.map (\_ -> Result.andThen parseAnthropicResponse (Ok response))
+
+                    Err err ->
+                        BackendTask.succeed (Err err)
+            )
 
 
 classifyWithOpenAi : ModelConfig -> String -> String -> BackendTask FatalError (Result String Classification.ClassificationResult)
@@ -1198,7 +1207,16 @@ classifyWithOpenAi modelConfig systemPrompt userMessage =
         , timeoutInMs = Just 120000
         }
         (BackendTask.Http.expectJson OpenAiApi.chatResponseDecoder)
-        |> BackendTask.map (Result.andThen parseOpenAiResponse)
+        |> BackendTask.andThen
+            (\result ->
+                case result of
+                    Ok response ->
+                        logCacheUsage modelConfig.key (openAiCacheLog response)
+                            |> BackendTask.map (\_ -> Result.andThen parseOpenAiResponse (Ok response))
+
+                    Err err ->
+                        BackendTask.succeed (Err err)
+            )
 
 
 parseAnthropicResponse : AnthropicApi.MessageResponse -> Result String Classification.ClassificationResult
@@ -1243,6 +1261,45 @@ parseOpenAiResponse response =
 
                 Err err ->
                     Err ("JSON decode error: " ++ Decode.errorToString err ++ " | Raw: " ++ textContent)
+
+
+{-| Log cache usage for a model, if any cached tokens were used.
+-}
+logCacheUsage : String -> Maybe String -> BackendTask FatalError ()
+logCacheUsage modelKey maybeCacheInfo =
+    case maybeCacheInfo of
+        Just info ->
+            Script.log ("  💾 [" ++ modelKey ++ "] " ++ info)
+
+        Nothing ->
+            BackendTask.succeed ()
+
+
+anthropicCacheLog : AnthropicApi.CacheUsage -> Maybe String
+anthropicCacheLog usage =
+    if usage.cacheReadInputTokens > 0 then
+        Just ("cache hit: " ++ String.fromInt usage.cacheReadInputTokens ++ " tokens read from cache")
+
+    else if usage.cacheCreationInputTokens > 0 then
+        Just ("cache miss: " ++ String.fromInt usage.cacheCreationInputTokens ++ " tokens written to cache")
+
+    else
+        Nothing
+
+
+openAiCacheLog : OpenAiApi.ChatResponse -> Maybe String
+openAiCacheLog response =
+    if response.cachedTokens > 0 then
+        Just
+            ("cache hit: "
+                ++ String.fromInt response.cachedTokens
+                ++ "/"
+                ++ String.fromInt response.promptTokens
+                ++ " prompt tokens cached"
+            )
+
+    else
+        Nothing
 
 
 {-| Classify an article with all applicable models in parallel using BackendTask.andMap.

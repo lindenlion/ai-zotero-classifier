@@ -26,6 +26,7 @@ type alias ChatResponse =
     , finishReason : FinishReason
     , promptTokens : Int
     , completionTokens : Int
+    , cachedTokens : Int
     }
 
 
@@ -85,7 +86,7 @@ finishReasonDecoder =
 
 chatResponseDecoder : Decoder ChatResponse
 chatResponseDecoder =
-    Decode.map4 ChatResponse
+    Decode.map5 ChatResponse
         choiceContentDecoder
         choiceFinishReasonDecoder
         (Decode.at [ "usage", "prompt_tokens" ] Decode.int
@@ -95,6 +96,11 @@ chatResponseDecoder =
         (Decode.at [ "usage", "completion_tokens" ] Decode.int
             |> Decode.maybe
             |> Decode.map (Maybe.withDefault 0)
+        )
+        (Decode.oneOf
+            [ Decode.at [ "usage", "prompt_tokens_details", "cached_tokens" ] Decode.int
+            , Decode.succeed 0
+            ]
         )
 
 

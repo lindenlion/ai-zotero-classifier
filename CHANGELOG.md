@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.3 - No more hidden surprises
+
+### Cache hit logging
+
+API responses now log cache usage per model, so you can tell if you're actually saving money or just sending vibes:
+- **Anthropic**: logs cache hits (tokens read) and misses (tokens written to cache) from the explicit `cache_control` system
+- **OpenAI-compatible** (Gemini, DeepSeek): logs `cached_tokens` from `prompt_tokens_details` when present — Gemini's implicit caching and DeepSeek's automatic prefix cache both report through this field
+
+Example log output:
+```
+  💾 [claude] cache hit: 4521 tokens read from cache
+  💾 [gemini] cache hit: 4096/4832 prompt tokens cached
+```
+
 ## v0.4.2 — Stats that actually tell the truth
 
 ### Two-tier stats reporting
