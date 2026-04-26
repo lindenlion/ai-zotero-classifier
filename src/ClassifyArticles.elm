@@ -39,6 +39,12 @@ type alias Config =
     }
 
 
+type alias RenameFrom =
+    { key : String
+    , before : String
+    }
+
+
 type alias ModelConfig =
     { key : String
     , apiFormat : ApiFormat
@@ -47,6 +53,7 @@ type alias ModelConfig =
     , baseUrl : String
     , enabled : Bool
     , maxTokens : Int
+    , renameFrom : Maybe RenameFrom
     }
 
 
@@ -127,6 +134,26 @@ capitalize s =
 
         Nothing ->
             s
+
+
+{-| Build the list of rename instructions from config models that have rename\_from set.
+Each entry is (oldKey, newKey, beforeTimestamp).
+-}
+appraisalKeyRenames : Config -> List { oldKey : String, newKey : String, before : String }
+appraisalKeyRenames config =
+    config.models
+        |> List.filterMap
+            (\m ->
+                m.renameFrom
+                    |> Maybe.map
+                        (\rf ->
+                            { oldKey = rf.key
+                            , newKey = m.key
+                            , before = rf.before
+                            }
+                        )
+            )
+        |> List.sortBy .before
 
 
 
@@ -489,6 +516,7 @@ type alias ConfigModelJson =
     , baseUrl : String
     , enabled : Bool
     , maxTokens : Int
+    , renameFrom : Maybe RenameFrom
     }
 
 
@@ -531,7 +559,7 @@ configJsonDecoder =
 
 configModelJsonDecoder : Decode.Decoder ConfigModelJson
 configModelJsonDecoder =
-    Decode.map7 ConfigModelJson
+    Decode.map8 ConfigModelJson
         (Decode.field "key" Decode.string)
         (Decode.field "apiFormat" Decode.string)
         (Decode.field "model" Decode.string)
@@ -539,6 +567,14 @@ configModelJsonDecoder =
         (Decode.field "baseUrl" Decode.string)
         (Decode.field "enabled" Decode.bool)
         (Decode.field "maxTokens" Decode.int)
+        (Decode.maybe
+            (Decode.field "rename_from"
+                (Decode.map2 RenameFrom
+                    (Decode.field "key" Decode.string)
+                    (Decode.field "before" Decode.string)
+                )
+            )
+        )
 
 
 {-| Resolve ZOTERO\_API\_KEY from env or secrets.txt fallback.
@@ -618,6 +654,7 @@ resolveModelApiKeysHelper models fileVars acc =
                                 , baseUrl = m.baseUrl
                                 , enabled = m.enabled
                                 , maxTokens = m.maxTokens
+                                , renameFrom = m.renameFrom
                                 }
                         in
                         resolveModelApiKeysHelper rest fileVars (modelConfig :: acc)
@@ -683,12 +720,23 @@ type alias ModelCollectionKeys =
 type alias Collections =
     { sourceKey : String
     , modelCollections : List ModelCollectionKeys
+    , allManagedCollectionKeys : Set String
     , currentVersionKey : String
     , versionKeys : Dict Int String
     , analysisAutoIncludedKey : String
     , analysisAutoExcludedKey : String
     , analysisStarSumKeys : Dict Int String
     }
+
+
+{-| Look up a collection key by name, returning Nothing if it doesn't exist.
+-}
+findCollectionKey : String -> List ZoteroApi.ZoteroCollection -> Maybe String
+findCollectionKey name allCollections =
+    allCollections
+        |> List.filter (\c -> c.name == name)
+        |> List.head
+        |> Maybe.map .key
 
 
 {-| Look up the collection keys for a specific model.
@@ -733,6 +781,41 @@ loggedRequest label reqConfig expect =
         |> BackendTask.andThen
             (\_ ->
                 BackendTask.Http.request reqConfig expect
+                    |> BackendTask.map Ok
+                    |> BackendTask.onError
+                        (\_ ->
+                            BackendTask.succeed (Err (reqConfig.method ++ " " ++ label ++ " failed"))
+                        )
+            )
+
+
+{-| Like loggedRequest but also extracts the Last-Modified-Version header from the response.
+Returns the library version as an Int on success.
+-}
+loggedRequestWithLibraryVersion :
+    String
+    ->
+        { url : String
+        , method : String
+        , headers : List ( String, String )
+        , body : BackendTask.Http.Body
+        , retries : Maybe Int
+        , timeoutInMs : Maybe Int
+        }
+    -> BackendTask FatalError (Result String Int)
+loggedRequestWithLibraryVersion label reqConfig =
+    Script.log (reqConfig.method ++ " " ++ label)
+        |> BackendTask.andThen
+            (\_ ->
+                BackendTask.Http.request reqConfig
+                    (BackendTask.Http.withMetadata
+                        (\metadata _ ->
+                            Dict.get "last-modified-version" metadata.headers
+                                |> Maybe.andThen String.toInt
+                                |> Maybe.withDefault 0
+                        )
+                        (BackendTask.Http.expectWhatever ())
+                    )
                     |> BackendTask.map Ok
                     |> BackendTask.onError
                         (\_ ->
@@ -818,6 +901,19 @@ resolveAllCollections config =
                         BackendTask.fail (FatalError.fromString errorMsg)
 
                     Nothing ->
+                        let
+                            -- Build a set of ALL managed collection keys (model, analysis, version, star sum).
+                            -- These are stripped from items before re-adding from the source of truth.
+                            modelCollKeys =
+                                config.models
+                                    |> List.concatMap
+                                        (\m ->
+                                            [ findCollectionKey (modelRelevantCollection m) allCollections
+                                            , findCollectionKey (modelIrrelevantCollection m) allCollections
+                                            ]
+                                        )
+                                    |> List.filterMap identity
+                        in
                         resolveSourceAndModelCollections config allCollections
                             |> BackendTask.andThen
                                 (\( sourceKey, modelColls ) ->
@@ -827,8 +923,18 @@ resolveAllCollections config =
                                                 resolveAnalysisCollections config allCollections
                                                     |> BackendTask.map
                                                         (\analysisCols ->
+                                                            let
+                                                                allManaged =
+                                                                    modelCollKeys
+                                                                        ++ Dict.values vKeys
+                                                                        ++ [ analysisCols.autoIncludedKey
+                                                                           , analysisCols.autoExcludedKey
+                                                                           ]
+                                                                        ++ Dict.values analysisCols.starSumKeys
+                                                            in
                                                             { sourceKey = sourceKey
                                                             , modelCollections = modelColls
+                                                            , allManagedCollectionKeys = Set.fromList allManaged
                                                             , currentVersionKey = currentKey
                                                             , versionKeys = vKeys
                                                             , analysisAutoIncludedKey = analysisCols.autoIncludedKey
@@ -890,13 +996,13 @@ resolveSourceAndModelCollections config allCollections =
     ensureCollection config config.sourceCollection allCollections
         |> BackendTask.andThen
             (\sourceKey ->
-                resolveModelCollectionsHelper config.models config allCollections []
+                resolveModelCollectionsHelper (config.models |> List.filter .enabled) config allCollections []
                     |> BackendTask.map (\modelColls -> ( sourceKey, modelColls ))
             )
 
 
-{-| Resolve included/excluded collections for each configured model.
-Always resolves for ALL models in config, not just selected ones.
+{-| Resolve included/excluded collections for each enabled model.
+Only creates collections for enabled models; disabled model collections are left as-is if they exist.
 -}
 resolveModelCollectionsHelper : List ModelConfig -> Config -> List ZoteroApi.ZoteroCollection -> List ModelCollectionKeys -> BackendTask FatalError (List ModelCollectionKeys)
 resolveModelCollectionsHelper models config allCollections acc =
@@ -1380,11 +1486,11 @@ combineBackendTasks tasks =
 {-| Determine which models need to screen this article.
 
   - Reprocess mode: all selected models (force re-run)
-  - Normal mode: only selected models without an existing appraisal
+  - Normal mode: apply renames first, then check which selected models lack an appraisal
 
 -}
-modelsForArticle : RunConfig -> ZoteroApi.ZoteroItem -> List ModelConfig
-modelsForArticle runConfig item =
+modelsForArticle : Config -> RunConfig -> ZoteroApi.ZoteroItem -> List ModelConfig
+modelsForArticle config runConfig item =
     if runConfig.reprocess then
         runConfig.selectedModels
 
@@ -1393,7 +1499,12 @@ modelsForArticle runConfig item =
             existingAppraisalKeys =
                 case Decode.decodeString Appraisal.decode item.data.callNumber of
                     Ok data ->
-                        data.appraisals |> Dict.keys |> Set.fromList
+                        data
+                            |> Appraisal.migrateToCurrentVersion
+                            |> Appraisal.renameKeys (appraisalKeyRenames config)
+                            |> .appraisals
+                            |> Dict.keys
+                            |> Set.fromList
 
                     Err _ ->
                         Set.empty
@@ -1402,29 +1513,49 @@ modelsForArticle runConfig item =
             |> List.filter (\m -> not (Set.member m.key existingAppraisalKeys))
 
 
-{-| Compute the minimum star rating across existing tags and new results.
-The most conservative model wins — returns the lowest relevance.
+{-| Compute the star tag from enabled appraisals and analysis category.
+
+  - Auto-included: minimum stars (weakest endorsement)
+  - Auto-excluded: maximum stars (strongest objection)
+  - Human review: mean stars rounded to nearest integer
+
+Returns Nothing if no enabled appraisals or no analysis.
+
 -}
-minStarRelevance : List ZoteroApi.ZoteroTag -> List Classification.ClassificationResult -> Maybe Classification.Relevance
-minStarRelevance existingTags newResults =
+computeStarRelevance : Dict String Appraisal.ProviderAppraisal -> Maybe Analysis.AnalysisData -> Maybe Classification.Relevance
+computeStarRelevance enabledAppraisals maybeAnalysis =
     let
-        existingStars =
-            existingTags
-                |> List.filterMap (\t -> Classification.emojiToRelevance t.tag)
-                |> List.map Classification.relevanceToInt
-
-        newStars =
-            newResults
-                |> List.map (\r -> Classification.relevanceToInt r.relevance)
-
-        allStars =
-            existingStars ++ newStars
-
-        finalInt =
-            List.minimum allStars
-                |> Maybe.withDefault 0
+        stars =
+            enabledAppraisals |> Dict.values |> List.map .relevance
     in
-    Classification.intToRelevance finalInt
+    case ( stars, maybeAnalysis ) of
+        ( [], _ ) ->
+            Nothing
+
+        ( _, Nothing ) ->
+            Nothing
+
+        ( _, Just analysis ) ->
+            let
+                starInt =
+                    case analysis.category of
+                        Analysis.AutoIncluded ->
+                            List.minimum stars |> Maybe.withDefault 0
+
+                        Analysis.AutoExcluded ->
+                            List.maximum stars |> Maybe.withDefault 0
+
+                        Analysis.HumanReview ->
+                            let
+                                sum =
+                                    List.sum stars
+
+                                count =
+                                    List.length stars
+                            in
+                            round (toFloat sum / toFloat count)
+            in
+            Classification.intToRelevance starInt
 
 
 {-| Check if death_after_therapy is flagged by ANY appraisal (existing or new).
@@ -1486,6 +1617,10 @@ updateItem config collections item modelResults allSucceeded =
                             Err _ ->
                                 Appraisal.empty
 
+                    -- Apply key renames before inserting new appraisals
+                    renamedAppraisalData =
+                        Appraisal.renameKeys (appraisalKeyRenames config) baseAppraisalData
+
                     -- Insert all model appraisals
                     appraisalDataWithoutAnalysis =
                         List.foldl
@@ -1498,7 +1633,7 @@ updateItem config collections item modelResults allSucceeded =
                                 in
                                 Appraisal.setAppraisal key appraisal acc
                             )
-                            baseAppraisalData
+                            renamedAppraisalData
                             modelResults
 
                     -- Compute analysis if all enabled models have appraisals
@@ -1516,9 +1651,13 @@ updateItem config collections item modelResults allSucceeded =
                     allModelsComplete =
                         Set.diff enabledModelKeys existingAppraisalKeys |> Set.isEmpty
 
+                    enabledAppraisals =
+                        appraisalDataWithoutAnalysis.appraisals
+                            |> Dict.filter (\k _ -> Set.member k enabledModelKeys)
+
                     analysis =
                         if allModelsComplete && not (Set.isEmpty enabledModelKeys) then
-                            Just (Analysis.compute appraisalDataWithoutAnalysis.appraisals)
+                            Just (Analysis.compute enabledAppraisals)
 
                         else
                             Nothing
@@ -1533,28 +1672,28 @@ updateItem config collections item modelResults allSucceeded =
                     newResultValues =
                         List.map Tuple.second modelResults
 
-                    -- Star tag: min across existing + new, most conservative wins
+                    -- Star tag: computed from enabled appraisals and analysis category
                     starRelevance =
-                        minStarRelevance item.data.tags newResultValues
+                        computeStarRelevance enabledAppraisals analysis
 
                     -- death_after_therapy: check ALL appraisals (existing + new)
                     hasDeath =
                         anyDeathAfterTherapy appraisalData newResultValues
 
-                    -- Build per-model target collections from results
+                    -- Build per-model target collections from all enabled appraisals
                     perModelCollectionKeys =
-                        modelResults
+                        enabledAppraisals
+                            |> Dict.toList
                             |> List.filterMap
-                                (\( key, result ) ->
+                                (\( key, appraisal ) ->
                                     collectionsForModel key collections
                                         |> Maybe.map
                                             (\mc ->
-                                                case Classification.relevanceToDecision result.relevance of
-                                                    Classification.Include ->
-                                                        mc.relevantKey
+                                                if appraisal.decision then
+                                                    mc.relevantKey
 
-                                                    Classification.Exclude ->
-                                                        mc.irrelevantKey
+                                                else
+                                                    mc.irrelevantKey
                                             )
                                 )
 
@@ -1591,22 +1730,11 @@ updateItem config collections item modelResults allSucceeded =
                                )
                             ++ analysisTag
 
-                    -- Collections: add per-model targets + version, remove source if all succeeded
-                    allVersionKeys =
-                        Dict.values collections.versionKeys
-
-                    -- Also strip any existing analysis collection keys before re-adding
-                    allAnalysisCollectionKeys =
-                        [ collections.analysisAutoIncludedKey, collections.analysisAutoExcludedKey ]
-                            ++ Dict.values collections.analysisStarSumKeys
-
+                    -- Strip all managed collections (model, analysis, version, star sum)
+                    -- then rebuild from source of truth
                     baseCollections =
                         item.data.collections
-                            |> List.filter
-                                (\c ->
-                                    not (List.member c allVersionKeys)
-                                        && not (List.member c allAnalysisCollectionKeys)
-                                )
+                            |> List.filter (\c -> not (Set.member c collections.allManagedCollectionKeys))
 
                     collectionsWithoutSource =
                         if allSucceeded then
@@ -1702,17 +1830,55 @@ Legacy reasoning notes and user-created notes are never modified or deleted.
 handleNotes : Config -> String -> List ZoteroApi.ZoteroNote -> String -> BackendTask FatalError (Result String ())
 handleNotes config parentItemKey childNotes noteHtml =
     let
-        autoGeneratedNote =
+        autoGeneratedNotes =
             childNotes
-                |> List.filter (\n -> String.contains "auto-generated from structured data" n.note)
-                |> List.head
+                |> List.filter ZoteroApi.isReasoningNote
     in
-    case autoGeneratedNote of
-        Nothing ->
+    case autoGeneratedNotes of
+        [] ->
             createNote config parentItemKey noteHtml
 
-        Just existing ->
-            patchNote config existing noteHtml
+        existing :: duplicates ->
+            -- Delete any duplicates first, then patch the surviving note
+            deleteDuplicateNotes config duplicates
+                |> BackendTask.andThen (\_ -> patchNote config existing noteHtml)
+
+
+{-| Delete a list of duplicate auto-generated notes.
+-}
+deleteDuplicateNotes : Config -> List ZoteroApi.ZoteroNote -> BackendTask FatalError ()
+deleteDuplicateNotes config notes =
+    case notes of
+        [] ->
+            BackendTask.succeed ()
+
+        note :: rest ->
+            deleteNote config note
+                |> BackendTask.andThen
+                    (\result ->
+                        case result of
+                            Ok _ ->
+                                deleteDuplicateNotes config rest
+
+                            Err errMsg ->
+                                Script.log ("  ⚠ Failed to delete note " ++ note.key ++ ": " ++ errMsg)
+                                    |> BackendTask.andThen (\_ -> deleteDuplicateNotes config rest)
+                    )
+
+
+deleteNote : Config -> ZoteroApi.ZoteroNote -> BackendTask FatalError (Result String ())
+deleteNote config note =
+    loggedRequest ("DELETE /items/" ++ note.key ++ " (delete duplicate note)")
+        { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items/" ++ note.key
+        , method = "DELETE"
+        , headers =
+            ( "If-Unmodified-Since-Version", String.fromInt note.version )
+                :: zoteroHeaders config.zoteroApiKey
+        , body = BackendTask.Http.emptyBody
+        , retries = Nothing
+        , timeoutInMs = Just 30000
+        }
+        (BackendTask.Http.expectWhatever ())
 
 
 
@@ -1781,7 +1947,8 @@ fetchItemsFromCollections config collectionKeys limit acc =
                         )
 
 
-{-| Prepared migration data for a single item, ready for batch upload.
+{-| Prepared data for a single item, ready for batch upload.
+Includes existing child notes for deduplication during the note phase.
 -}
 type alias MigrationPatch =
     { itemKey : String
@@ -1790,6 +1957,7 @@ type alias MigrationPatch =
     , collections : List String
     , callNumber : String
     , noteHtml : String
+    , existingNotes : List ZoteroApi.ZoteroNote
     }
 
 
@@ -1799,114 +1967,147 @@ and computing the new callNumber and note HTML. No writes happen here.
 prepareMigrateItem : Config -> Collections -> ZoteroApi.ZoteroItem -> BackendTask FatalError (Result String MigrationPatch)
 prepareMigrateItem config collections item =
     getChildNotes config item.key
-        |> andThenResult
-            (\childNotes ->
-                let
-                    reasoningNotes =
-                        List.filter ZoteroApi.isReasoningNote childNotes
+        |> andThenResult (\childNotes -> prepareMigrateItemWithNotes config collections item childNotes)
 
-                    reasoningNoteHtml =
-                        reasoningNotes |> List.head |> Maybe.map .note
 
-                    baseAppraisalData =
-                        resolveAppraisalDataWithNotes item reasoningNoteHtml
+{-| Prepare migration data for a single item using pre-fetched child notes.
+Pure computation — no IO needed.
+-}
+prepareMigrateItemWithNotes : Config -> Collections -> ZoteroApi.ZoteroItem -> List ZoteroApi.ZoteroNote -> BackendTask FatalError (Result String MigrationPatch)
+prepareMigrateItemWithNotes config collections item childNotes =
+    let
+        reasoningNotes =
+            List.filter ZoteroApi.isReasoningNote childNotes
 
-                    -- Compute analysis if all enabled models have appraisals
-                    enabledModelKeys =
-                        config.models
-                            |> List.filter .enabled
-                            |> List.map .key
-                            |> Set.fromList
+        reasoningNoteHtml =
+            reasoningNotes |> List.head |> Maybe.map .note
 
-                    existingAppraisalKeys =
-                        baseAppraisalData.appraisals
-                            |> Dict.keys
-                            |> Set.fromList
+        baseAppraisalData =
+            resolveAppraisalDataWithNotes item reasoningNoteHtml
+                |> Appraisal.renameKeys (appraisalKeyRenames config)
 
-                    allModelsComplete =
-                        Set.diff enabledModelKeys existingAppraisalKeys |> Set.isEmpty
+        enabledModelKeys =
+            config.models
+                |> List.filter .enabled
+                |> List.map .key
+                |> Set.fromList
 
-                    analysis =
-                        if allModelsComplete && not (Set.isEmpty enabledModelKeys) then
-                            Just (Analysis.compute baseAppraisalData.appraisals)
+        existingAppraisalKeys =
+            baseAppraisalData.appraisals
+                |> Dict.keys
+                |> Set.fromList
 
-                        else
-                            Nothing
+        allModelsComplete =
+            Set.diff enabledModelKeys existingAppraisalKeys |> Set.isEmpty
 
-                    appraisalData =
-                        { baseAppraisalData | analysis = analysis }
+        enabledAppraisals =
+            baseAppraisalData.appraisals
+                |> Dict.filter (\k _ -> Set.member k enabledModelKeys)
 
-                    callNumberJson =
-                        Appraisal.encode appraisalData
-                            |> Encode.encode 0
+        analysis =
+            if allModelsComplete && not (Set.isEmpty enabledModelKeys) then
+                Just (Analysis.compute enabledAppraisals)
 
-                    allVersionKeys =
-                        Dict.values collections.versionKeys
+            else
+                Nothing
 
-                    allAnalysisCollectionKeys =
-                        [ collections.analysisAutoIncludedKey, collections.analysisAutoExcludedKey ]
-                            ++ Dict.values collections.analysisStarSumKeys
+        appraisalData =
+            { baseAppraisalData | analysis = analysis }
 
-                    collectionsWithoutOldVersionsOrAnalysis =
-                        item.data.collections
-                            |> List.filter
-                                (\c ->
-                                    not (List.member c allVersionKeys)
-                                        && not (List.member c allAnalysisCollectionKeys)
-                                )
+        callNumberJson =
+            Appraisal.encode appraisalData
+                |> Encode.encode 0
 
-                    analysisCollectionKey =
-                        analysis
-                            |> Maybe.andThen
-                                (\a ->
-                                    case a.category of
-                                        Analysis.AutoIncluded ->
-                                            Just collections.analysisAutoIncludedKey
+        -- Strip all managed collections, rebuild from source of truth
+        baseCollections =
+            item.data.collections
+                |> List.filter (\c -> not (Set.member c collections.allManagedCollectionKeys))
 
-                                        Analysis.AutoExcluded ->
-                                            Just collections.analysisAutoExcludedKey
+        analysisCollectionKey =
+            analysis
+                |> Maybe.andThen
+                    (\a ->
+                        case a.category of
+                            Analysis.AutoIncluded ->
+                                Just collections.analysisAutoIncludedKey
 
-                                        Analysis.HumanReview ->
-                                            Dict.get a.totalStars collections.analysisStarSumKeys
-                                )
-                            |> Maybe.map List.singleton
-                            |> Maybe.withDefault []
+                            Analysis.AutoExcluded ->
+                                Just collections.analysisAutoExcludedKey
 
-                    newCollections =
-                        (collectionsWithoutOldVersionsOrAnalysis
-                            ++ ( collections.currentVersionKey :: analysisCollectionKey )
-                        )
-                            |> dedup
-
-                    -- Clean and rebuild tags with analysis tag
-                    cleanedTags =
-                        item.data.tags
-                            |> List.filter (\t -> not (Analysis.isAnalysisTag t.tag))
-
-                    analysisTag =
-                        analysis
-                            |> Maybe.map (\a -> [ { tag = Analysis.categoryToTag a } ])
-                            |> Maybe.withDefault []
-
-                    newTags =
-                        cleanedTags ++ analysisTag
-                in
-                BackendTask.succeed
-                    (Ok
-                        { itemKey = item.key
-                        , itemVersion = item.version
-                        , tags = newTags
-                        , collections = newCollections
-                        , callNumber = callNumberJson
-                        , noteHtml = Appraisal.generateNoteHtml appraisalData
-                        }
+                            Analysis.HumanReview ->
+                                Dict.get a.totalStars collections.analysisStarSumKeys
                     )
+                |> Maybe.map List.singleton
+                |> Maybe.withDefault []
+
+        -- Rebuild per-model collections from enabled appraisals
+        perModelCollectionKeys =
+            enabledAppraisals
+                |> Dict.toList
+                |> List.filterMap
+                    (\( key, appraisal ) ->
+                        collectionsForModel key collections
+                            |> Maybe.map
+                                (\mc ->
+                                    if appraisal.decision then
+                                        mc.relevantKey
+
+                                    else
+                                        mc.irrelevantKey
+                                )
+                    )
+
+        newCollections =
+            (baseCollections
+                ++ perModelCollectionKeys
+                ++ ( collections.currentVersionKey :: analysisCollectionKey )
             )
+                |> dedup
+
+        cleanedTags =
+            item.data.tags
+                |> List.filter
+                    (\t ->
+                        not (Classification.isStarTag t.tag)
+                            && not (Analysis.isAnalysisTag t.tag)
+                    )
+
+        starRelevance =
+            computeStarRelevance enabledAppraisals analysis
+
+        starTag =
+            case starRelevance of
+                Just stars ->
+                    [ { tag = Classification.relevanceToEmoji stars } ]
+
+                Nothing ->
+                    []
+
+        analysisTag =
+            analysis
+                |> Maybe.map (\a -> [ { tag = Analysis.categoryToTag a } ])
+                |> Maybe.withDefault []
+
+        newTags =
+            cleanedTags ++ starTag ++ analysisTag
+    in
+    BackendTask.succeed
+        (Ok
+            { itemKey = item.key
+            , itemVersion = item.version
+            , tags = newTags
+            , collections = newCollections
+            , callNumber = callNumberJson
+            , noteHtml = Appraisal.generateNoteHtml appraisalData
+            , existingNotes = childNotes
+            }
+        )
 
 
 {-| Send a batch of item patches via POST /items (max 50 per request).
+Returns the library version from the Last-Modified-Version response header.
 -}
-batchPatchItems : Config -> List MigrationPatch -> BackendTask FatalError (Result String ())
+batchPatchItems : Config -> List MigrationPatch -> BackendTask FatalError (Result String Int)
 batchPatchItems config patches =
     let
         encoded =
@@ -1923,7 +2124,25 @@ batchPatchItems config patches =
                     patches
                 )
     in
-    loggedRequest ("POST /items (batch update " ++ String.fromInt (List.length patches) ++ " items)")
+    loggedRequestWithLibraryVersion ("POST /items (batch update " ++ String.fromInt (List.length patches) ++ " items)")
+        { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items"
+        , method = "POST"
+        , headers = zoteroHeaders config.zoteroApiKey
+        , body = BackendTask.Http.jsonBody encoded
+        , retries = Nothing
+        , timeoutInMs = Just 60000
+        }
+
+
+{-| Send a batch of new notes via POST /items (max 50 per request).
+-}
+batchCreateNotes : Config -> List { parentItemKey : String, noteHtml : String } -> BackendTask FatalError (Result String ())
+batchCreateNotes config notes =
+    let
+        encoded =
+            ZoteroApi.encodeBatchCreateNotes notes
+    in
+    loggedRequest ("POST /items (batch create " ++ String.fromInt (List.length notes) ++ " notes)")
         { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items"
         , method = "POST"
         , headers = zoteroHeaders config.zoteroApiKey
@@ -1934,16 +2153,111 @@ batchPatchItems config patches =
         (BackendTask.Http.expectWhatever ())
 
 
-{-| Send a batch of new notes via POST /items (max 50 per request).
+{-| Handle notes for a batch of patches using bulk Zotero API calls.
+Uses the pre-fetched existingNotes from each patch to avoid extra GET requests.
+Sends at most 3 requests: batch delete duplicates, batch patch existing, batch create new.
 -}
-batchCreateNotes : Config -> List MigrationPatch -> BackendTask FatalError (Result String ())
-batchCreateNotes config patches =
+handleBatchNotes : Config -> Int -> List MigrationPatch -> BackendTask FatalError (Result String ())
+handleBatchNotes config libraryVersion patches =
+    let
+        -- For each patch, categorize the note action needed
+        noteActions =
+            patches
+                |> List.map
+                    (\patch ->
+                        let
+                            autoNotes =
+                                patch.existingNotes |> List.filter ZoteroApi.isReasoningNote
+                        in
+                        case autoNotes of
+                            [] ->
+                                { create = Just { parentItemKey = patch.itemKey, noteHtml = patch.noteHtml }
+                                , patch = Nothing
+                                , delete = []
+                                }
+
+                            existing :: duplicates ->
+                                { create = Nothing
+                                , patch = Just { key = existing.key, version = existing.version, noteHtml = patch.noteHtml }
+                                , delete = duplicates
+                                }
+                    )
+
+        toCreate =
+            noteActions |> List.filterMap .create
+
+        toPatch =
+            noteActions |> List.filterMap .patch
+
+        toDelete =
+            noteActions |> List.concatMap .delete
+
+        deleteStep =
+            if List.isEmpty toDelete then
+                BackendTask.succeed (Ok ())
+
+            else
+                batchDeleteNotes config libraryVersion toDelete
+
+        patchStep =
+            if List.isEmpty toPatch then
+                BackendTask.succeed (Ok ())
+
+            else
+                batchPatchNotes config toPatch
+
+        createStep =
+            if List.isEmpty toCreate then
+                BackendTask.succeed (Ok ())
+
+            else
+                batchCreateNotes config toCreate
+    in
+    deleteStep
+        |> andThenResult (\_ -> patchStep)
+        |> andThenResult (\_ -> createStep)
+
+
+{-| Batch delete duplicate notes via DELETE /items?itemKey=K1,K2,K3.
+Uses the library version from the most recent write operation.
+-}
+batchDeleteNotes : Config -> Int -> List ZoteroApi.ZoteroNote -> BackendTask FatalError (Result String ())
+batchDeleteNotes config libraryVersion notes =
+    let
+        keys =
+            notes |> List.map .key |> String.join ","
+    in
+    loggedRequest ("DELETE /items?itemKey=... (batch delete " ++ String.fromInt (List.length notes) ++ " duplicate notes)")
+        { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items?itemKey=" ++ keys
+        , method = "DELETE"
+        , headers =
+            ( "If-Unmodified-Since-Version", String.fromInt libraryVersion )
+                :: zoteroHeaders config.zoteroApiKey
+        , body = BackendTask.Http.emptyBody
+        , retries = Nothing
+        , timeoutInMs = Just 30000
+        }
+        (BackendTask.Http.expectWhatever ())
+
+
+{-| Batch patch existing notes via POST /items (multi-object write with key+version).
+-}
+batchPatchNotes : Config -> List { key : String, version : Int, noteHtml : String } -> BackendTask FatalError (Result String ())
+batchPatchNotes config notes =
     let
         encoded =
-            ZoteroApi.encodeBatchCreateNotes
-                (List.map (\p -> { parentItemKey = p.itemKey, noteHtml = p.noteHtml }) patches)
+            Encode.list
+                (\n ->
+                    Encode.object
+                        [ ( "key", Encode.string n.key )
+                        , ( "version", Encode.int n.version )
+                        , ( "note", Encode.string n.noteHtml )
+                        , ( "tags", Encode.list (\t -> Encode.object [ ( "tag", Encode.string t ) ]) [ "auto-generated" ] )
+                        ]
+                )
+                notes
     in
-    loggedRequest ("POST /items (batch create " ++ String.fromInt (List.length patches) ++ " notes)")
+    loggedRequest ("POST /items (batch patch " ++ String.fromInt (List.length notes) ++ " notes)")
         { url = zoteroBaseUrl config.zoteroLibraryId ++ "/items"
         , method = "POST"
         , headers = zoteroHeaders config.zoteroApiKey
@@ -2064,6 +2378,9 @@ migrateBatch config collections items stats =
             )
 
 
+{-| Prepare migration patches for a list of items.
+Fetches child notes in parallel (25 at a time), then computes patches sequentially.
+-}
 prepareMigrationPatches :
     Config
     -> Collections
@@ -2073,6 +2390,100 @@ prepareMigrationPatches :
     -> List MigrationPatch
     -> BackendTask FatalError (List MigrationPatch)
 prepareMigrationPatches config collections items idx total acc =
+    let
+        itemCount =
+            List.length items
+    in
+    Script.log ("  📥 Fetching child notes for " ++ String.fromInt itemCount ++ " items (25 at a time)...")
+        |> BackendTask.andThen (\_ -> fetchAllChildNotes config items)
+        |> BackendTask.andThen
+            (\notesByItem ->
+                computeMigrationPatches config collections items notesByItem idx total acc
+            )
+
+
+{-| Fetch child notes for all items in parallel waves of 25.
+Returns a Dict mapping item keys to their child notes.
+-}
+fetchAllChildNotes : Config -> List ZoteroApi.ZoteroItem -> BackendTask FatalError (Dict String (List ZoteroApi.ZoteroNote))
+fetchAllChildNotes config items =
+    let
+        waves =
+            chunk 25 items
+    in
+    fetchNoteWaves config waves Dict.empty 1 (List.length waves)
+
+
+fetchNoteWaves : Config -> List (List ZoteroApi.ZoteroItem) -> Dict String (List ZoteroApi.ZoteroNote) -> Int -> Int -> BackendTask FatalError (Dict String (List ZoteroApi.ZoteroNote))
+fetchNoteWaves config waves acc waveIdx totalWaves =
+    case waves of
+        [] ->
+            BackendTask.succeed acc
+
+        wave :: rest ->
+            Script.log ("    Wave " ++ String.fromInt waveIdx ++ "/" ++ String.fromInt totalWaves ++ " (" ++ String.fromInt (List.length wave) ++ " items)")
+                |> BackendTask.andThen
+                    (\_ ->
+                        combineBackendTasks
+                            (wave
+                                |> List.map
+                                    (\item ->
+                                        fetchChildNotesWithRetry config item.key 0
+                                            |> BackendTask.map (\notes -> ( item.key, notes ))
+                                    )
+                            )
+                    )
+                |> BackendTask.andThen
+                    (\results ->
+                        let
+                            newAcc =
+                                List.foldl (\( key, notes ) d -> Dict.insert key notes d) acc results
+                        in
+                        fetchNoteWaves config rest newAcc (waveIdx + 1) totalWaves
+                    )
+
+
+{-| Fetch child notes for a single item with retry and exponential backoff.
+On failure, retries up to 3 times with 2s, 4s, 8s delays.
+Returns empty list if all retries fail.
+-}
+fetchChildNotesWithRetry : Config -> String -> Int -> BackendTask FatalError (List ZoteroApi.ZoteroNote)
+fetchChildNotesWithRetry config itemKey retryCount =
+    getChildNotes config itemKey
+        |> BackendTask.andThen
+            (\result ->
+                case result of
+                    Ok notes ->
+                        BackendTask.succeed notes
+
+                    Err errMsg ->
+                        if retryCount >= 3 then
+                            Script.log ("    ⚠ Failed to fetch notes for " ++ itemKey ++ " after 3 retries: " ++ errMsg)
+                                |> BackendTask.map (\_ -> [])
+
+                        else
+                            let
+                                delayMs =
+                                    2000 * (2 ^ retryCount)
+                            in
+                            Script.log ("    ⏳ Retry " ++ String.fromInt (retryCount + 1) ++ "/3 for " ++ itemKey ++ " in " ++ String.fromInt (delayMs // 1000) ++ "s...")
+                                |> BackendTask.andThen (\_ -> Script.sleep delayMs)
+                                |> BackendTask.andThen (\_ -> fetchChildNotesWithRetry config itemKey (retryCount + 1))
+            )
+
+
+{-| Compute migration patches from pre-fetched notes. Pure computation + timestamp.
+-}
+computeMigrationPatches :
+    Config
+    -> Collections
+    -> List ZoteroApi.ZoteroItem
+    -> Dict String (List ZoteroApi.ZoteroNote)
+    -> Int
+    -> Int
+    -> List MigrationPatch
+    -> BackendTask FatalError (List MigrationPatch)
+computeMigrationPatches config collections items notesByItem idx total acc =
     case items of
         [] ->
             BackendTask.succeed (List.reverse acc)
@@ -2081,18 +2492,21 @@ prepareMigrationPatches config collections items idx total acc =
             let
                 article =
                     ZoteroApi.articleDataFromItem item
+
+                childNotes =
+                    Dict.get item.key notesByItem |> Maybe.withDefault []
             in
             Script.log ("[" ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ "] Preparing: " ++ String.left 60 article.title ++ "...")
-                |> BackendTask.andThen (\_ -> prepareMigrateItem config collections item)
+                |> BackendTask.andThen (\_ -> prepareMigrateItemWithNotes config collections item childNotes)
                 |> BackendTask.andThen
                     (\result ->
                         case result of
                             Ok patch ->
-                                prepareMigrationPatches config collections rest (idx + 1) total (patch :: acc)
+                                computeMigrationPatches config collections rest notesByItem (idx + 1) total (patch :: acc)
 
                             Err errMsg ->
                                 Script.log ("  ⚠ Skipped: " ++ errMsg)
-                                    |> BackendTask.andThen (\_ -> prepareMigrationPatches config collections rest (idx + 1) total acc)
+                                    |> BackendTask.andThen (\_ -> computeMigrationPatches config collections rest notesByItem (idx + 1) total acc)
                     )
 
 
@@ -2114,7 +2528,7 @@ sendChunksHelper config chunks idx total =
         batch :: rest ->
             Script.log ("\n📤 Uploading chunk " ++ String.fromInt idx ++ "/" ++ String.fromInt total ++ " (" ++ String.fromInt (List.length batch) ++ " items)...")
                 |> BackendTask.andThen (\_ -> batchPatchItems config batch)
-                |> andThenResult (\_ -> batchCreateNotes config batch)
+                |> andThenResult (\libraryVersion -> handleBatchNotes config libraryVersion batch)
                 |> andThenResult (\_ -> sendChunksHelper config rest (idx + 1) total)
 
 
@@ -2239,7 +2653,7 @@ processArticle config runConfig collections item stats =
             ZoteroApi.articleDataFromItem item
 
         applicableModels =
-            modelsForArticle runConfig item
+            modelsForArticle config runConfig item
 
         modelNames =
             applicableModels |> List.map .key |> String.join ", "

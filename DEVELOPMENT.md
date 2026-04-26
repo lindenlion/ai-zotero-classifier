@@ -8,11 +8,11 @@ Automated classification of PubMed articles for IEI (Inborn Errors of Immunity) 
 src/ClassifyArticles.elm          Main script (CLI, API orchestration, migration)
 src/libs/
   Analysis.elm                    Decision analysis: aggregate scoring, categories, tags, collections
-  Appraisal.elm                   Structured appraisal schema (v2), encode/decode, note generation
+  Appraisal.elm                   Structured appraisal schema (v3), encode/decode, note generation, key renaming
   Classification.elm              Relevance types, decision logic, JSON decoders
   ZoteroApi.elm                   Zotero item/collection types, JSON codecs, article extraction
   AnthropicApi.elm                Anthropic Messages API types, request encoder, response decoder
-  OpenAiApi.elm                   OpenAI-compatible chat API encoder/decoder (DeepSeek, etc.)
+  OpenAiApi.elm                   OpenAI-compatible chat API encoder/decoder (DeepSeek, Gemini, etc.)
   Stats.elm                       Batch statistics and circuit breaker logic
 config.json                       Model configuration: which AI models to use (from template)
 prompt.txt                        System prompt for article classification (loaded at runtime)
@@ -52,8 +52,9 @@ Fill in `config.json` with model configuration:
   - `model` — exact model name sent in API calls (e.g. "claude-opus-4-6", "deepseek-reasoner")
   - `apiKeyEnvVar` — name of the env var holding the API key (e.g. "ANTHROPIC_API_KEY")
   - `baseUrl` — API base URL (e.g. "https://api.anthropic.com", "https://api.deepseek.com")
-  - `enabled` — `true` to include in default model set, `false` to skip unless explicitly selected with `--models`
+  - `enabled` — `true` to include in default model set, `false` to skip unless explicitly selected with `--models`. Only enabled models contribute to analysis, star tags, and model collections.
   - `maxTokens` — maximum output tokens for this model's API calls
+  - `rename_from` (optional) — `{ "key": "old-key", "before": "ISO8601-timestamp" }`. Renames an existing appraisal key to this model's key when the appraisal was created before the cutoff. Used when retiring a model: the old appraisal is preserved under the new key with a `renamedFrom` provenance marker (schema v3). Multiple renames targeting the same source key are applied oldest-first.
 
 ## Commands
 

@@ -372,27 +372,27 @@ suite =
             [ test "identifies inclusion reasoning note" <|
                 \_ ->
                     ZoteroApi.isReasoningNote
-                        { key = "N1", version = 1, note = "<p><em>Inclusion reasoning: relevant</em></p>" }
+                        { key = "N1", version = 1, note = "<p><em>Inclusion reasoning: relevant</em></p>", tags = [] }
                         |> Expect.equal True
             , test "identifies exclusion reasoning note" <|
                 \_ ->
                     ZoteroApi.isReasoningNote
-                        { key = "N2", version = 1, note = "<p><em>Exclusion reasoning: not relevant</em></p>" }
+                        { key = "N2", version = 1, note = "<p><em>Exclusion reasoning: not relevant</em></p>", tags = [] }
                         |> Expect.equal True
             , test "rejects unrelated note" <|
                 \_ ->
                     ZoteroApi.isReasoningNote
-                        { key = "N3", version = 1, note = "<p>Just a random note</p>" }
+                        { key = "N3", version = 1, note = "<p>Just a random note</p>", tags = [] }
                         |> Expect.equal False
             , test "rejects empty note" <|
                 \_ ->
                     ZoteroApi.isReasoningNote
-                        { key = "N4", version = 1, note = "" }
+                        { key = "N4", version = 1, note = "", tags = [] }
                         |> Expect.equal False
             , test "identifies auto-generated note" <|
                 \_ ->
                     ZoteroApi.isReasoningNote
-                        { key = "N5", version = 1, note = "<p><em>This note is auto-generated from structured data</em></p>" }
+                        { key = "N5", version = 1, note = "<p><em>This note is auto-generated from structured data</em></p>", tags = [] }
                         |> Expect.equal True
             ]
         , describe "buildNoteHtml"
@@ -435,7 +435,7 @@ suite =
                         html =
                             ZoteroApi.buildNoteHtml { isInclude = True, reasoning = "r", note = "n" }
                     in
-                    ZoteroApi.isReasoningNote { key = "K", version = 1, note = html }
+                    ZoteroApi.isReasoningNote { key = "K", version = 1, note = html, tags = [] }
                         |> Expect.equal True
             , test "exclude note is recognized by isReasoningNote" <|
                 \_ ->
@@ -443,7 +443,7 @@ suite =
                         html =
                             ZoteroApi.buildNoteHtml { isInclude = False, reasoning = "r", note = "" }
                     in
-                    ZoteroApi.isReasoningNote { key = "K", version = 1, note = html }
+                    ZoteroApi.isReasoningNote { key = "K", version = 1, note = html, tags = [] }
                         |> Expect.equal True
             ]
         ]

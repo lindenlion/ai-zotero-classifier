@@ -14,10 +14,20 @@
     {
       "key": "deepseek",
       "apiFormat": "openai",
-      "model": "deepseek-reasoner",
+      "model": "deepseek-v4-pro",
       "apiKeyEnvVar": "DEEPSEEK_API_KEY",
       "baseUrl": "https://api.deepseek.com",
       "enabled": true,
+      "maxTokens": 5000
+    },
+    {
+      "key": "deepseek-legacy",
+      "rename_from": { "key": "deepseek", "before": "2026-04-24T00:00:00.000Z" },
+      "apiFormat": "openai",
+      "model": "deepseek-reasoner",
+      "apiKeyEnvVar": "DEEPSEEK_API_KEY",
+      "baseUrl": "https://api.deepseek.com",
+      "enabled": false,
       "maxTokens": 5000
     }
   ]

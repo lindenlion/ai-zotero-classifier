@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.6.0 — Unexpected legacy
+
+### Appraisal key renaming via `rename_from`
+
+When swapping models (e.g. upgrading from `deepseek-reasoner` to `deepseek-v4-pro`), previous appraisals would be orphaned under the old key. Now you can tell the system to rename them.
+
+Add `"rename_from"` with a timestamp cutoff to a model entry in `config.json`:
+```json
+{
+  "key": "deepseek-legacy",
+  "rename_from": { "key": "deepseek", "before": "2026-04-24T00:00:00.000Z" },
+  "enabled": false,
+  ...
+}
+```
+
+Renames are applied automatically whenever an article is processed (classification or migration), **before** new appraisals are inserted. This means:
+1. Old `"deepseek"` appraisal (timestamped before the cutoff) gets renamed to `"deepseek-legacy"`
+2. New model (e.g. `"deepseek-v4-pro"`) can then write its appraisal under `"deepseek"` without collision
+3. No previous work is lost — the old appraisal is preserved under its new key
+
+The `before` timestamp ensures that if a newer model reuses the same key, its appraisals won't be accidentally renamed. Only appraisals created before the cutoff are affected.
+
+Safety: won't overwrite if the target key already has an appraisal.
+
+### Schema version 3
+
+- Bumped `callNumber` schema from v2 to v3
+- `ProviderAppraisal` gains a `renamedFrom` field (`Maybe String`) — records the original key when an appraisal was renamed, so the provenance is always traceable
+- Shown in the auto-generated Zotero note as "Renamed from: deepseek"
+- v2 → v3 migration sets `renamedFrom = Nothing` on all existing appraisals
+- `renamedFrom` is only written to JSON when present (no bloat for non-renamed appraisals)
+
+### Auto-generated note deduplication
+
+
+- `handleNotes` now finds ALL auto-generated notes (not just the first), patches one, and deletes the rest
+- Detection uses both content markers ("auto-generated from structured data", "Inclusion/Exclusion reasoning") and the new `"auto-generated"` tag
+- All auto-generated notes (new and patched) now get an `"auto-generated"` tag for reliable future detection
+- `deleteNote` sends `DELETE` with `If-Unmodified-Since-Version` for safe concurrent access
+- `ZoteroNote` type now includes `tags` for tag-based detection
+- Batch note handling uses library version from `Last-Modified-Version` response header for batch deletes
+
+### Enabled-only analysis and collections
+
+Analysis, star tags, and model collections now only consider **enabled** models. Disabled/legacy model appraisals are preserved in the data but don't influence decisions or placement.
+
+- `Analysis.compute` receives only enabled appraisals — disabled models don't affect star totals, inclusion/exclusion counts, or auto-include/auto-exclude categorization
+- `modelsForArticle` applies renames and migration before checking existing appraisals — correctly identifies when a renamed model key needs re-screening
+- Multiple `rename_from` entries targeting the same source key are sorted by `before` timestamp (oldest-first) to ensure each rename matches the correct appraisal
+
+### Collection management overhaul
+
+All managed collections (model included/excluded, analysis, version, star sum) are now stripped and rebuilt from source of truth on every patch. No more stale collection memberships.
+
+- `allManagedCollectionKeys` set built at startup from all models (enabled + disabled) plus analysis and version collections
+- Both classification and migration paths strip all managed collections, then re-add only what's current
+- Collections only created for enabled models — disabled model collections are left as-is but items are removed from them
+- Per-model collections rebuilt from all enabled appraisals (not just current run's results)
+
+### Context-aware star tags
+
+Star tags now reflect the analysis category and only consider enabled models:
+
+- **Auto-included** (unanimous agreement): minimum stars — shows the weakest endorsement
+- **Auto-excluded** (unanimous rejection): maximum stars — shows the strongest objection
+- **Human review** (mixed signals): mean stars rounded to nearest integer
+- Recalculated on every patch (classification and migration), so changing models always produces correct tags
+- No star tag if analysis hasn't been computed yet
+
+
 ## v0.5.0 — The "take a random handful and look closely" release
 
 ### New `--random-sample` flag

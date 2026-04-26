@@ -11,6 +11,7 @@ module Appraisal exposing
     , migrateFromLegacy
     , migrateToCurrentVersion
     , needsMigration
+    , renameKeys
     , setAppraisal
     )
 
@@ -38,6 +39,7 @@ type alias ProviderAppraisal =
     , isRefusal : Bool
     , model : String
     , timestamp : String
+    , renamedFrom : Maybe String
     }
 
 
@@ -53,7 +55,7 @@ type alias ASReviewData =
 
 currentSchemaVersion : Int
 currentSchemaVersion =
-    2
+    3
 
 
 empty : AppraisalData
@@ -80,11 +82,31 @@ migrateToCurrentVersion data =
     else
         data
             |> migrateV1toV2
+            |> migrateV2toV3
 
 
 migrateV1toV2 : AppraisalData -> AppraisalData
 migrateV1toV2 data =
-    { data | version = 2, analysis = Nothing }
+    if data.version >= 2 then
+        data
+
+    else
+        { data | version = 2, analysis = Nothing }
+
+
+{-| v2 -> v3: Add renamedFrom field (Nothing) to all existing appraisals.
+-}
+migrateV2toV3 : AppraisalData -> AppraisalData
+migrateV2toV3 data =
+    if data.version >= 3 then
+        data
+
+    else
+        { data
+            | version = 3
+            , appraisals =
+                Dict.map (\_ a -> { a | renamedFrom = Nothing }) data.appraisals
+        }
 
 
 
@@ -117,15 +139,23 @@ encode data =
 encodeProviderAppraisal : ProviderAppraisal -> Encode.Value
 encodeProviderAppraisal pa =
     Encode.object
-        [ ( "relevance", Encode.int pa.relevance )
-        , ( "decision", Encode.bool pa.decision )
-        , ( "reasoning", Encode.string pa.reasoning )
-        , ( "note", Encode.string pa.note )
-        , ( "deathAfterTherapy", Encode.bool pa.deathAfterTherapy )
-        , ( "isRefusal", Encode.bool pa.isRefusal )
-        , ( "model", Encode.string pa.model )
-        , ( "timestamp", Encode.string pa.timestamp )
-        ]
+        ([ ( "relevance", Encode.int pa.relevance )
+         , ( "decision", Encode.bool pa.decision )
+         , ( "reasoning", Encode.string pa.reasoning )
+         , ( "note", Encode.string pa.note )
+         , ( "deathAfterTherapy", Encode.bool pa.deathAfterTherapy )
+         , ( "isRefusal", Encode.bool pa.isRefusal )
+         , ( "model", Encode.string pa.model )
+         , ( "timestamp", Encode.string pa.timestamp )
+         ]
+            ++ (case pa.renamedFrom of
+                    Just oldKey ->
+                        [ ( "renamedFrom", Encode.string oldKey ) ]
+
+                    Nothing ->
+                        []
+               )
+        )
 
 
 encodeASReviewData : ASReviewData -> Encode.Value
@@ -151,7 +181,10 @@ decode =
 
 providerAppraisalDecoder : Decoder ProviderAppraisal
 providerAppraisalDecoder =
-    Decode.map8 ProviderAppraisal
+    Decode.map8
+        (\rel dec reas note death ref model ts ->
+            ProviderAppraisal rel dec reas note death ref model ts
+        )
         (Decode.field "relevance" Decode.int)
         (Decode.field "decision" Decode.bool)
         (Decode.field "reasoning" Decode.string)
@@ -160,6 +193,14 @@ providerAppraisalDecoder =
         (Decode.field "isRefusal" Decode.bool)
         (Decode.field "model" Decode.string)
         (Decode.field "timestamp" Decode.string)
+        |> andMap (Decode.maybe (Decode.field "renamedFrom" Decode.string))
+
+
+{-| Apply an additional decoder to a partially-applied decoder (pipeline style).
+-}
+andMap : Decoder a -> Decoder (a -> b) -> Decoder b
+andMap argDecoder funcDecoder =
+    Decode.map2 (\f a -> f a) funcDecoder argDecoder
 
 
 asReviewDataDecoder : Decoder ASReviewData
@@ -200,12 +241,42 @@ fromClassificationResult meta result =
     , isRefusal = Classification.isRefusal result
     , model = meta.model
     , timestamp = meta.timestamp
+    , renamedFrom = Nothing
     }
 
 
 setAppraisal : String -> ProviderAppraisal -> AppraisalData -> AppraisalData
 setAppraisal provider appraisal data =
     { data | appraisals = Dict.insert provider appraisal data.appraisals }
+
+
+{-| Rename appraisal keys based on a list of rename instructions.
+Only renames if:
+  - The old key exists
+  - The new key doesn't (to avoid overwriting)
+  - The appraisal's timestamp is before the cutoff (so newer appraisals under the same key are left alone)
+-}
+renameKeys : List { oldKey : String, newKey : String, before : String } -> AppraisalData -> AppraisalData
+renameKeys renames data =
+    let
+        applyRename rename appraisals =
+            case Dict.get rename.oldKey appraisals of
+                Just appraisal ->
+                    if Dict.member rename.newKey appraisals then
+                        appraisals
+
+                    else if appraisal.timestamp < rename.before then
+                        appraisals
+                            |> Dict.remove rename.oldKey
+                            |> Dict.insert rename.newKey { appraisal | renamedFrom = Just rename.oldKey }
+
+                    else
+                        appraisals
+
+                Nothing ->
+                    appraisals
+    in
+    { data | appraisals = List.foldl applyRename data.appraisals renames }
 
 
 
@@ -288,6 +359,14 @@ providerToHtml ( name, pa ) =
             else
                 "EXCLUDE"
 
+        renamedLine =
+            case pa.renamedFrom of
+                Just oldKey ->
+                    "<p><small>Renamed from: " ++ oldKey ++ "</small></p>"
+
+                Nothing ->
+                    ""
+
         header =
             "<h3>" ++ name ++ " (" ++ pa.model ++ ")</h3>"
 
@@ -318,7 +397,7 @@ providerToHtml ( name, pa ) =
             else
                 ""
     in
-    header ++ decisionLine ++ refusalLine ++ todoLine ++ reasoningLine ++ timestampLine
+    header ++ renamedLine ++ decisionLine ++ refusalLine ++ todoLine ++ reasoningLine ++ timestampLine
 
 
 asreviewToHtml : ASReviewData -> String
@@ -411,6 +490,7 @@ migrateFromLegacy { tags, reasoningNoteHtml } =
                 , isRefusal = Classification.isRefusal classificationResult
                 , model = "opus-4-6"
                 , timestamp = "31 March 2026"
+                , renamedFrom = Nothing
                 }
         in
         Just { version = 2, appraisals = Dict.singleton "claude" appraisal, asreview = Nothing, analysis = Nothing }

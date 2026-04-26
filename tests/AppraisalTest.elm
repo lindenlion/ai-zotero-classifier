@@ -19,12 +19,13 @@ sampleAppraisal =
     , isRefusal = False
     , model = "claude-opus-4-6"
     , timestamp = "2026-04-13T10:30:00.000Z"
+    , renamedFrom = Nothing
     }
 
 
 sampleData : Appraisal.AppraisalData
 sampleData =
-    { version = 2
+    { version = 3
     , appraisals = Dict.singleton "claude" sampleAppraisal
     , asreview = Nothing
     , analysis = Nothing
@@ -415,5 +416,138 @@ suite =
                         |> Maybe.andThen (\d -> Dict.get "claude" d.appraisals)
                         |> Maybe.map .model
                         |> Expect.equal (Just "opus-4-6")
+            ]
+        , describe "renameKeys"
+            [ test "renames an existing key when timestamp is before cutoff" <|
+                \_ ->
+                    let
+                        data =
+                            sampleData
+                                |> Appraisal.setAppraisal "deepseek" { sampleAppraisal | model = "deepseek-reasoner", timestamp = "2026-04-01T00:00:00.000Z" }
+
+                        renamed =
+                            Appraisal.renameKeys [ { oldKey = "deepseek", newKey = "deepseek-legacy", before = "2026-04-24T00:00:00.000Z" } ] data
+                    in
+                    Expect.all
+                        [ \d -> Dict.member "deepseek-legacy" d.appraisals |> Expect.equal True
+                        , \d -> Dict.member "deepseek" d.appraisals |> Expect.equal False
+                        , \d -> Dict.get "deepseek-legacy" d.appraisals |> Maybe.map .model |> Expect.equal (Just "deepseek-reasoner")
+                        , \d -> Dict.get "deepseek-legacy" d.appraisals |> Maybe.andThen .renamedFrom |> Expect.equal (Just "deepseek")
+                        , \d -> Dict.member "claude" d.appraisals |> Expect.equal True
+                        ]
+                        renamed
+            , test "does NOT rename when timestamp is after cutoff" <|
+                \_ ->
+                    let
+                        data =
+                            sampleData
+                                |> Appraisal.setAppraisal "deepseek" { sampleAppraisal | model = "deepseek-v4-pro", timestamp = "2026-05-01T00:00:00.000Z" }
+
+                        renamed =
+                            Appraisal.renameKeys [ { oldKey = "deepseek", newKey = "deepseek-legacy", before = "2026-04-24T00:00:00.000Z" } ] data
+                    in
+                    Expect.all
+                        [ \d -> Dict.member "deepseek" d.appraisals |> Expect.equal True
+                        , \d -> Dict.member "deepseek-legacy" d.appraisals |> Expect.equal False
+                        ]
+                        renamed
+            , test "does nothing when old key doesn't exist" <|
+                \_ ->
+                    let
+                        renamed =
+                            Appraisal.renameKeys [ { oldKey = "nonexistent", newKey = "new-key", before = "2099-01-01T00:00:00.000Z" } ] sampleData
+                    in
+                    Expect.equal sampleData.appraisals renamed.appraisals
+            , test "does not overwrite if new key already exists" <|
+                \_ ->
+                    let
+                        data =
+                            sampleData
+                                |> Appraisal.setAppraisal "deepseek" { sampleAppraisal | model = "deepseek-reasoner", timestamp = "2026-04-01T00:00:00.000Z" }
+
+                        renamed =
+                            Appraisal.renameKeys [ { oldKey = "deepseek", newKey = "claude", before = "2099-01-01T00:00:00.000Z" } ] data
+                    in
+                    Expect.all
+                        [ \d -> Dict.get "claude" d.appraisals |> Maybe.map .model |> Expect.equal (Just "claude-opus-4-6")
+                        , \d -> Dict.member "deepseek" d.appraisals |> Expect.equal True
+                        ]
+                        renamed
+            , test "applies multiple renames" <|
+                \_ ->
+                    let
+                        data =
+                            sampleData
+                                |> Appraisal.setAppraisal "deepseek" { sampleAppraisal | model = "deepseek-v3", timestamp = "2026-04-01T00:00:00.000Z" }
+                                |> Appraisal.setAppraisal "gemini" { sampleAppraisal | model = "gemini-pro", timestamp = "2026-04-01T00:00:00.000Z" }
+
+                        renamed =
+                            Appraisal.renameKeys
+                                [ { oldKey = "deepseek", newKey = "deepseek-legacy", before = "2026-04-24T00:00:00.000Z" }
+                                , { oldKey = "gemini", newKey = "gemini-legacy", before = "2026-04-24T00:00:00.000Z" }
+                                ]
+                                data
+                    in
+                    Expect.all
+                        [ \d -> Dict.member "deepseek-legacy" d.appraisals |> Expect.equal True
+                        , \d -> Dict.member "gemini-legacy" d.appraisals |> Expect.equal True
+                        , \d -> Dict.member "deepseek" d.appraisals |> Expect.equal False
+                        , \d -> Dict.member "gemini" d.appraisals |> Expect.equal False
+                        , \d -> Dict.size d.appraisals |> Expect.equal 3
+                        ]
+                        renamed
+            , test "multiple renames on same key must be applied oldest-first" <|
+                \_ ->
+                    -- deepseek was used with model A (early), then model B (later)
+                    -- Two renames target "deepseek" with different cutoffs
+                    -- Only works correctly if applied oldest-first
+                    let
+                        data =
+                            sampleData
+                                |> Appraisal.setAppraisal "deepseek"
+                                    { sampleAppraisal | model = "deepseek-reasoner", timestamp = "2026-03-15T00:00:00.000Z" }
+
+                        -- Apply oldest cutoff first, then newest — simulates sorted order
+                        renamed =
+                            Appraisal.renameKeys
+                                [ { oldKey = "deepseek", newKey = "deepseek-legacy1", before = "2026-04-01T00:00:00.000Z" }
+                                , { oldKey = "deepseek", newKey = "deepseek-legacy2", before = "2026-04-24T00:00:00.000Z" }
+                                ]
+                                data
+                    in
+                    Expect.all
+                        [ -- The appraisal (timestamp 03-15) is before 04-01, so it matches the first rename
+                          \d -> Dict.member "deepseek-legacy1" d.appraisals |> Expect.equal True
+                        , \d -> Dict.get "deepseek-legacy1" d.appraisals |> Maybe.map .model |> Expect.equal (Just "deepseek-reasoner")
+
+                        -- deepseek-legacy2 should NOT exist (nothing left to rename)
+                        , \d -> Dict.member "deepseek-legacy2" d.appraisals |> Expect.equal False
+
+                        -- Original key should be gone
+                        , \d -> Dict.member "deepseek" d.appraisals |> Expect.equal False
+                        ]
+                        renamed
+            , test "wrong order would misassign the rename" <|
+                \_ ->
+                    -- Same data but renames applied newest-first (wrong order)
+                    let
+                        data =
+                            sampleData
+                                |> Appraisal.setAppraisal "deepseek"
+                                    { sampleAppraisal | model = "deepseek-reasoner", timestamp = "2026-03-15T00:00:00.000Z" }
+
+                        renamed =
+                            Appraisal.renameKeys
+                                [ { oldKey = "deepseek", newKey = "deepseek-legacy2", before = "2026-04-24T00:00:00.000Z" }
+                                , { oldKey = "deepseek", newKey = "deepseek-legacy1", before = "2026-04-01T00:00:00.000Z" }
+                                ]
+                                data
+                    in
+                    -- With wrong order, the newer cutoff grabs it first
+                    Expect.all
+                        [ \d -> Dict.member "deepseek-legacy2" d.appraisals |> Expect.equal True
+                        , \d -> Dict.member "deepseek-legacy1" d.appraisals |> Expect.equal False
+                        ]
+                        renamed
             ]
         ]
