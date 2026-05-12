@@ -1,6 +1,6 @@
 # Development
 
-Automated classification of PubMed articles for IEI (Inborn Errors of Immunity) research using Claude AI and the Zotero API. Written in Elm as an [elm-pages v3](https://elm-pages.com) script (3.3.3).
+Automated classification of PubMed articles for IEI (Inborn Errors of Immunity) research using one or more AI models (Claude, DeepSeek, and other OpenAI-compatible providers) and the Zotero API. Written in Elm as an [elm-pages v3](https://elm-pages.com) script (3.3.4).
 
 ## Project Structure
 

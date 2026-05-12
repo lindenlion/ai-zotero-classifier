@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — Documentation tidy-up
+
+- README rewritten to match the current multi-model workflow: dropped references to `ZOTERO_LIBRARY_ID` / `ANTHROPIC_MODEL` env vars and `config.txt` (now `config.json` + `secrets.txt`), updated example commands to v0.6.0, documented `--models`, `--reprocess`, `--migrate`, and `--random-sample`, and replaced the "Claude included/excluded" description with the current AI auto-included / AI auto-excluded / "Sum of N stars" collections.
+- CLAUDE.md "Required Environment Variables" section replaced with a Configuration section pointing at `config.json` and `secrets.txt`.
+- DEVELOPMENT.md: bumped elm-pages version note from 3.3.3 to 3.3.4 to match `package.json`, and broadened the one-line summary to reflect multi-model support.
+
 ## v0.6.0 — Unexpected legacy
 
 ### Appraisal key renaming via `rename_from`
